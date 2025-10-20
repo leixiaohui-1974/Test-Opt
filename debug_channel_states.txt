@@ -1,0 +1,1 @@
+[('gate1_pool', 'level'), ('gate1_pool', 'discharge'), ('reach1', 'level'), ('reach1', 'discharge'), ('gate2_pool', 'level'), ('gate2_pool', 'discharge'), ('reach2', 'level'), ('reach2', 'discharge'), ('reach3', 'level'), ('reach3', 'discharge')]

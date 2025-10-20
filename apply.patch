@@ -1,0 +1,34 @@
+*** Update File: OptiChat/Feas/water_network_generic.py
+@@
+     def _shortage_penalty_expression(model_ref):
+         if not shortage_nodes:
+             return 0.0
+         return sum(
+             model_ref.shortage_penalty_factor[node_id] * model_ref.shortage[node_id, period]
+             for node_id in shortage_nodes
+             for period in model_ref.T
+         )
+ 
++    def _idz_slack_expression(model_ref):
++        if not idz_nodes:
++            return 0.0
++        return sum(
++            model_ref.idz_slack_pos[node_id, period] + model_ref.idz_slack_neg[node_id, period]
++            for node_id in idz_nodes
++            for period in model_ref.T
++        )
++
+     model.total_energy_cost = Expression(rule=_energy_cost_expression, doc="total energy cost")
+     model.total_shortage_volume = Expression(rule=_shortage_volume_expression, doc="shortage volume")
+     model.total_shortage_penalty = Expression(rule=_shortage_penalty_expression, doc="shortage penalty")
++    model.total_idz_slack = Expression(rule=_idz_slack_expression, doc="IDZ dynamics slack magnitude")
+ 
+     model.obj = Objective(
+-        expr=pump_cost_weight * model.total_energy_cost + shortage_weight * model.total_shortage_penalty,
++        expr=pump_cost_weight * model.total_energy_cost
++        + shortage_weight * model.total_shortage_penalty
++        + DEFAULT_IDZ_SLACK_PENALTY * model.total_idz_slack,
+         sense=minimize,
+         doc="minimise energy and shortage penalty",
+     )
+*** End Patch

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 DEFAULT_SHORTAGE_PENALTY = 1e5
 DEFAULT_PUMP_COST = 200.0
+DEFAULT_IDZ_SLACK_PENALTY = 1e6
 
 
 def _resolve_time_index(network_cfg: "NetworkConfig") -> List[str]:
@@ -232,21 +233,21 @@ def build_water_network_model(
 
     # 变量
     def _flow_bounds(m, e, t):
-    cap = edge_capacity_map.get(e)
-    if cap is not None:
-        return (0.0, float(cap))
-    curve = sos2_curves.get(e)
-    if curve:
-        return (0.0, float(curve.breakpoints[-1]))
-    return (0.0, None)
+        cap = edge_capacity_map.get(e)
+        if cap is not None:
+            return (0.0, float(cap))
+        curve = sos2_curves.get(e)
+        if curve:
+            return (0.0, float(curve.breakpoints[-1]))
+        return (0.0, None)
 
-model.flow = Var(
-    model.E,
-    model.T,
-    bounds=_flow_bounds,
-    within=NonNegativeReals,
-    doc="���������߱���",
-)
+    model.flow = Var(
+        model.E,
+        model.T,
+        bounds=_flow_bounds,
+        within=NonNegativeReals,
+        doc="节点流量变量",
+    )
 
     state_index = list(state_specs.keys())
     if state_index:
