@@ -30,6 +30,7 @@ from collections import deque
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from Feas.visualization import configure_chinese_font
+from Feas.control_evaluation import ControlPerformanceEvaluator, print_performance_report
 
 
 class IDZCanalPool:
@@ -681,27 +682,44 @@ def run_mpc_simulation(scenario_type="normal", dt=15):
 
 
 def calculate_performance_metrics(df, canal):
-    """计算性能指标"""
+    """计算性能指标（增强版：使用控制评价模块）"""
     metrics = {}
 
-    # 水深偏差
+    # === 使用控制评价模块 ===
+    pool_targets = {f"pool{i+1}_depth": pool.target_depth for i, pool in enumerate(canal.pools)}
+    evaluator = ControlPerformanceEvaluator(pool_targets)
+
+    # 时域性能评价
+    depth_cols = [f"pool{i+1}_depth" for i in range(4)]
+    time_domain_metrics = evaluator.evaluate_time_domain(df, time_col="time", value_cols=depth_cols)
+
+    # 控制平滑度评价
+    gate_cols = [f"gate{i}_flow" for i in range(5)]
+    smoothness_metrics = evaluator.evaluate_control_smoothness(df, gate_cols, time_col="time")
+
+    # 综合评分
+    comprehensive_score = evaluator.compute_综合评分(time_domain_metrics, smoothness_metrics)
+
+    # === 保持原有格式的指标（向后兼容）===
     for i, pool in enumerate(canal.pools):
         depth_col = f"pool{i+1}_depth"
-        target = pool.target_depth
-        mae = np.mean(np.abs(df[depth_col] - target))
-        rmse = np.sqrt(np.mean((df[depth_col] - target) ** 2))
-        max_dev = np.max(np.abs(df[depth_col] - target))
+        if depth_col in time_domain_metrics:
+            td_metrics = time_domain_metrics[depth_col]
+            metrics[f"pool{i+1}_mae"] = td_metrics['MAE']
+            metrics[f"pool{i+1}_rmse"] = td_metrics['RMSE']
+            metrics[f"pool{i+1}_max_dev"] = td_metrics['max_abs_error']
 
-        metrics[f"pool{i+1}_mae"] = mae
-        metrics[f"pool{i+1}_rmse"] = rmse
-        metrics[f"pool{i+1}_max_dev"] = max_dev
-
-    # 控制平滑度
     for i in range(5):
         gate_col = f"gate{i}_flow"
-        flow_changes = np.abs(np.diff(df[gate_col]))
-        metrics[f"gate{i}_avg_change"] = np.mean(flow_changes)
-        metrics[f"gate{i}_max_change"] = np.max(flow_changes)
+        if gate_col in smoothness_metrics:
+            sm_metrics = smoothness_metrics[gate_col]
+            metrics[f"gate{i}_avg_change"] = sm_metrics['avg_change_rate']
+            metrics[f"gate{i}_max_change"] = sm_metrics['max_change_rate']
+
+    # === 添加详细评价指标 ===
+    metrics['detailed_time_domain'] = time_domain_metrics
+    metrics['detailed_smoothness'] = smoothness_metrics
+    metrics['comprehensive_score'] = comprehensive_score
 
     return metrics
 
@@ -716,19 +734,32 @@ def visualize_results(df, metrics, scenario, output_dir):
     scenario_desc = scenario.get("description", "Unknown")
     fig.suptitle(f"渠道MPC控制仿真结果 - {scenario_desc}", fontsize=16, fontweight="bold")
 
-    # 子图1：各池段水深变化
+    # 子图1：各池段水深变化（放大y轴显示波动）
     ax = fig.add_subplot(gs[0, :])
-    for i in range(1, 5):
-        ax.plot(df["time"], df[f"pool{i}_depth"], label=f"Pool {i}", linewidth=2)
-        # 添加目标水深线
-        target_depth = [1.5, 1.6, 1.8, 2.0][i - 1]  # 倒序
-        ax.axhline(y=target_depth, linestyle="--", alpha=0.5)
 
-    ax.set_xlabel("时间 (分钟)")
-    ax.set_ylabel("水深 (m)")
-    ax.set_title("各池段水深变化")
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
+    # 计算合适的y轴范围（目标值±15cm）
+    pool_targets = [2.0, 1.8, 1.6, 1.5]
+
+    for i in range(1, 5):
+        target = pool_targets[i-1]
+        ax.plot(df["time"], df[f"pool{i}_depth"], label=f"Pool {i} (目标{target}m)", linewidth=2.5, alpha=0.8)
+        # 添加目标水深线
+        ax.axhline(y=target, linestyle="--", color=f"C{i-1}", alpha=0.6, linewidth=1.5)
+
+    # 动态设置y轴范围：基于实际数据范围
+    all_depths = []
+    for i in range(1, 5):
+        all_depths.extend(df[f"pool{i}_depth"].values)
+
+    y_min = min(all_depths) - 0.05
+    y_max = max(all_depths) + 0.05
+    ax.set_ylim(y_min, y_max)
+
+    ax.set_xlabel("时间 (分钟)", fontsize=11)
+    ax.set_ylabel("水深 (m)", fontsize=11)
+    ax.set_title("各池段水深变化（放大显示波动细节）", fontsize=12, fontweight="bold")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, alpha=0.3, linestyle=':')
 
     # 子图2：闸门流量
     ax = fig.add_subplot(gs[1, 0])
@@ -750,18 +781,27 @@ def visualize_results(df, metrics, scenario, output_dir):
     ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
 
-    # 子图4：水深偏差
+    # 子图4：水深偏差（放大显示）
     ax = fig.add_subplot(gs[2, 0])
     targets = [2.0, 1.8, 1.6, 1.5]
+
+    all_deviations = []
     for i in range(1, 5):
         deviation = df[f"pool{i}_depth"] - targets[i - 1]
-        ax.plot(df["time"], deviation, label=f"Pool {i}", linewidth=2)
-    ax.axhline(y=0, color="black", linestyle="--", alpha=0.7)
-    ax.set_xlabel("时间 (分钟)")
-    ax.set_ylabel("水深偏差 (m)")
-    ax.set_title("水深偏差（实际-目标）")
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
+        ax.plot(df["time"], deviation * 100, label=f"Pool {i}", linewidth=2, alpha=0.8)  # 转换为cm
+        all_deviations.extend(deviation.values * 100)
+
+    ax.axhline(y=0, color="black", linestyle="--", alpha=0.7, linewidth=2)
+
+    # 动态设置y轴范围
+    dev_max = max(abs(min(all_deviations)), abs(max(all_deviations)))
+    ax.set_ylim(-dev_max * 1.1, dev_max * 1.1)
+
+    ax.set_xlabel("时间 (分钟)", fontsize=10)
+    ax.set_ylabel("水深偏差 (cm)", fontsize=10)
+    ax.set_title("水深偏差（实际-目标）", fontsize=11, fontweight="bold")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3, linestyle=':')
 
     # 子图5：闸门调节频率
     ax = fig.add_subplot(gs[2, 1])
@@ -952,10 +992,20 @@ def create_mpc_animation(df, scenario, output_dir, canal):
 
         # === 子图1: 水深变化 ===
         ax_depth.set_xlim(0, times[-1])
-        ax_depth.set_ylim(0.5, 2.5)
+
+        # 动态y轴范围（基于当前数据）
+        current_depths = [df[f"pool{i}_depth"].iloc[:current_idx+1].values for i in range(1, 5)]
+        all_current = [d for depths in current_depths for d in depths]
+        if len(all_current) > 0:
+            y_min = min(all_current) - 0.08
+            y_max = max(all_current) + 0.08
+            ax_depth.set_ylim(y_min, y_max)
+        else:
+            ax_depth.set_ylim(1.3, 2.1)
+
         ax_depth.set_xlabel("时间 (分钟)", fontsize=11)
         ax_depth.set_ylabel("水深 (m)", fontsize=11)
-        ax_depth.set_title("各池段水深变化（实时+MPC预测时域）", fontsize=12, fontweight="bold")
+        ax_depth.set_title("各池段水深变化（实时+MPC预测时域，放大显示）", fontsize=12, fontweight="bold")
         ax_depth.grid(True, alpha=0.3)
 
         # 绘制历史水深（已发生）
@@ -1044,17 +1094,12 @@ def create_mpc_animation(df, scenario, output_dir, canal):
         ax_offtakes.axvline(x=current_time, color="red", linestyle="-", linewidth=2, alpha=0.5)
         ax_offtakes.legend(loc="best", fontsize=9)
 
-        # === 子图4: 水深偏差 ===
+        # === 子图4: 水深偏差（转换为cm）===
         ax_deviation.set_xlim(0, times[-1])
-        ax_deviation.set_ylim(-0.3, 0.3)
-        ax_deviation.set_xlabel("时间 (分钟)", fontsize=10)
-        ax_deviation.set_ylabel("水深偏差 (m)", fontsize=10)
-        ax_deviation.set_title("水深偏差（实际-目标）", fontsize=11, fontweight="bold")
-        ax_deviation.axhline(y=0, color="black", linestyle="--", alpha=0.5, linewidth=1.5)
-        ax_deviation.grid(True, alpha=0.3)
 
+        all_devs = []
         for i in range(1, 5):
-            deviation = df[f"pool{i}_depth"][:current_idx+1] - pool_targets[i-1]
+            deviation = (df[f"pool{i}_depth"][:current_idx+1] - pool_targets[i-1]) * 100  # 转cm
             ax_deviation.plot(
                 times[:current_idx+1],
                 deviation,
@@ -1062,6 +1107,20 @@ def create_mpc_animation(df, scenario, output_dir, canal):
                 label=f"Pool {i}",
                 alpha=0.8
             )
+            all_devs.extend(deviation.values)
+
+        # 动态y轴
+        if len(all_devs) > 0:
+            dev_max = max(abs(min(all_devs)), abs(max(all_devs)))
+            ax_deviation.set_ylim(-dev_max * 1.2, dev_max * 1.2)
+        else:
+            ax_deviation.set_ylim(-15, 15)
+
+        ax_deviation.set_xlabel("时间 (分钟)", fontsize=10)
+        ax_deviation.set_ylabel("水深偏差 (cm)", fontsize=10)
+        ax_deviation.set_title("水深偏差（实际-目标）", fontsize=11, fontweight="bold")
+        ax_deviation.axhline(y=0, color="black", linestyle="--", alpha=0.6, linewidth=1.5)
+        ax_deviation.grid(True, alpha=0.3)
 
         ax_deviation.axvline(x=current_time, color="red", linestyle="-", linewidth=2, alpha=0.5)
         ax_deviation.legend(loc="best", fontsize=8, ncol=2)
@@ -1367,6 +1426,13 @@ def main():
         csv_path = output_dir / f"results_{scenario_type}_v2.csv"
         df.to_csv(csv_path, index=False, encoding="utf-8-sig")
         print(f"\n✓ 结果已保存: {csv_path}")
+
+        # 打印性能评价报告
+        print_performance_report(
+            metrics['detailed_time_domain'],
+            metrics['detailed_smoothness'],
+            metrics['comprehensive_score']
+        )
 
         # 可视化
         visualize_results(df, metrics, scenario, output_dir)
