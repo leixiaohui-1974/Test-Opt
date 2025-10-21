@@ -175,6 +175,16 @@ def build_water_network_model(
     outgoing = {n: [e for e in edge_ids if from_map[e] == n] for n in node_ids}
     prev_time = {t: time_index[i - 1] if i > 0 else None for i, t in enumerate(time_index)}
 
+    # 边容量和曲线映射
+    edge_capacity_map: Dict[str, float] = {}
+    for edge in edges:
+        attr = edge.get("attributes", {}) or {}
+        capacity = attr.get("capacity")
+        if capacity is not None:
+            edge_capacity_map[edge["id"]] = float(capacity)
+
+    sos2_curves: Dict[str, object] = {}  # 预留SOS2曲线支持
+
     # 时间序列参数
     inflow_data: Dict[Tuple[str, str], float] = {}
     demand_data: Dict[Tuple[str, str], float] = {}
@@ -186,6 +196,7 @@ def build_water_network_model(
     state_initial: Dict[Tuple[str, str], float] = {}
     state_bounds: Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]] = {}
     storage_state_map: Dict[str, Tuple[str, str]] = {}
+    state_piecewise_relations: List[Tuple] = []  # 状态分段线性关系列表
 
     for node in nodes:
         node_id = node["id"]
@@ -314,13 +325,17 @@ def build_water_network_model(
             doc="采用分段效率的边",
         )
         model.pw_segments = Set(
-            model.E,
+            model.pw_edges,
             initialize=lambda m, e: piecewise_segments[e],
             ordered=True,
             doc="分段索引",
         )
+
+        # 创建分段索引集合（边, 分段）
+        segment_index = [(e, s) for e in piecewise_segments.keys() for s in piecewise_segments[e]]
+        model.segment_index = Set(initialize=segment_index, dimen=2, doc="分段索引")
+
         model.segment_flow = Var(
-            model.E,
             model.segment_index,
             model.T,
             within=NonNegativeReals,
@@ -329,6 +344,7 @@ def build_water_network_model(
     else:
         model.pw_edges = Set(initialize=[], doc="无分段效率边")
         model.pw_segments = Set(initialize=[], doc="空分段集合")
+        model.segment_index = Set(initialize=[], dimen=3, doc="empty segment index")
 
     # 约束
     def mass_balance_rule(m, n, t):
@@ -364,10 +380,11 @@ def build_water_network_model(
             cap = segment_capacity.get((e, s))
             if cap is None:
                 return Constraint.Skip
-            return m.segment_flow[e, s, t] <= cap
+            return m.segment_flow[(e, s), t] <= cap
 
         model.segment_capacity_limit = Constraint(
             model.segment_index,
+            model.T,
             rule=segment_capacity_rule,
             doc="segment capacity limit",
         )
@@ -375,7 +392,7 @@ def build_water_network_model(
         def segment_flow_sum_rule(m, e, t):
             if e not in piecewise_segments:
                 return Constraint.Skip
-            return sum(m.segment_flow[e, s, t] for s in piecewise_segments[e]) == m.flow[e, t]
+            return sum(m.segment_flow[(e, s), t] for s in piecewise_segments[e]) == m.flow[e, t]
 
         model.segment_flow_sum = Constraint(
             model.E,
@@ -383,9 +400,6 @@ def build_water_network_model(
             rule=segment_flow_sum_rule,
             doc="segment flow consistency",
         )
-
-    else:
-        model.segment_index = Set(initialize=[], dimen=3, doc="empty segment index")
 
     # 目标函数
     pump_cost_weight = float(weights.get("pumping_cost", DEFAULT_PUMP_COST))
@@ -407,7 +421,7 @@ def build_water_network_model(
         if not piecewise_segments:
             return linear_part
         piecewise_part = sum(
-            segment_cost[(e, s)] * m.segment_flow[e, s, t]
+            segment_cost[(e, s)] * m.segment_flow[(e, s), t]
             for e in model.pw_edges
             for s in model.pw_segments[e]
             for t in model.T
