@@ -33,7 +33,7 @@ from Feas.visualization import configure_chinese_font
 
 
 class IDZCanalPool:
-    """IDZ模型的渠道池段"""
+    """IDZ模型的渠道池段（改进版：Muskingum蓄量关系）"""
 
     def __init__(
         self,
@@ -45,48 +45,141 @@ class IDZCanalPool:
         target_depth,
         delay_time,
         backwater_coeff=0.1,
+        side_slope=1.5,  # 边坡系数（梯形断面）
     ):
         """
         Args:
             pool_id: 池段编号
             length: 池段长度 (m)
-            width: 渠道宽度 (m)
+            width: 渠底宽度 (m)
             bottom_slope: 底坡
-            roughness: 糙率
+            roughness: 糙率 (Manning n)
             target_depth: 目标水深 (m)
             delay_time: 延迟时间 (分钟)
             backwater_coeff: 顶托系数
+            side_slope: 边坡系数 (m=1.5表示1:1.5的边坡)
         """
         self.pool_id = pool_id
         self.length = length
-        self.width = width
+        self.width = width  # 底宽
         self.bottom_slope = bottom_slope
         self.roughness = roughness
         self.target_depth = target_depth
         self.delay_time = delay_time
         self.backwater_coeff = backwater_coeff
+        self.side_slope = side_slope  # 梯形断面边坡
 
-        # 蓄水容量（简化为矩形断面）
-        self.storage_capacity = length * width * target_depth
+        # Muskingum参数（蓄量=f(流量,水位)）
+        # S = K[X*I + (1-X)*O]，其中K是蓄量常数，X是权重
+        wave_celerity = self._calculate_wave_celerity()
+        self.muskingum_K = (length / (wave_celerity * 60)) * 2.5  # 增大K值2.5倍（增加系统惯性）
+        self.muskingum_X = 0.20  # 稍微降低X值，增加滞后效应
 
         # 延迟队列（存储历史入流）
         self.inflow_history = deque(maxlen=int(delay_time) + 1)
 
         # 当前状态
         self.current_depth = target_depth
-        self.current_storage = self.depth_to_storage(target_depth)
+        self.current_inflow = 20.0  # 初始流量
+        self.current_outflow = 20.0
+        # 初始化时，流量平衡，使用目标水深
+        self.current_storage = self._calculate_muskingum_storage(
+            target_depth, 20.0, 20.0
+        )
 
-    def depth_to_storage(self, depth):
-        """水深转换为蓄水量"""
-        return self.length * self.width * depth
+    def _calculate_wave_celerity(self):
+        """计算波速 (m/s) - 用于Muskingum K参数"""
+        # 简化：c = dQ/dA ≈ 5/3 * v
+        # 估算平均流速
+        normal_depth = self.target_depth
+        area = self._get_wetted_area(normal_depth)
+        perimeter = self._get_wetted_perimeter(normal_depth)
+        hydraulic_radius = area / perimeter
 
-    def storage_to_depth(self, storage):
-        """蓄水量转换为水深"""
-        return storage / (self.length * self.width)
+        # Manning公式估算流速
+        velocity = (1/self.roughness) * (hydraulic_radius ** (2/3)) * (self.bottom_slope ** 0.5)
+        celerity = (5/3) * velocity
+        return max(celerity, 0.5)  # 最小0.5 m/s
+
+    def _get_wetted_area(self, depth):
+        """计算过流断面面积（梯形断面）"""
+        # A = (b + m*h)*h
+        return (self.width + self.side_slope * depth) * depth
+
+    def _get_wetted_perimeter(self, depth):
+        """计算湿周（梯形断面）"""
+        # P = b + 2*h*sqrt(1+m^2)
+        return self.width + 2 * depth * np.sqrt(1 + self.side_slope**2)
+
+    def _flow_to_depth(self, flow):
+        """根据流量计算水深（Manning公式反算）"""
+        # 迭代求解：Q = (1/n) * A * R^(2/3) * S^(1/2)
+        # 简化：使用目标水深附近的线性近似
+        target_flow = self._depth_to_flow(self.target_depth)
+        if abs(target_flow) < 0.1:
+            return self.target_depth
+
+        depth_ratio = (flow / target_flow) ** 0.6  # 简化关系
+        estimated_depth = self.target_depth * depth_ratio
+
+        # 限制在合理范围
+        return np.clip(estimated_depth, self.target_depth * 0.2, self.target_depth * 2.5)
+
+    def _depth_to_flow(self, depth):
+        """根据水深计算流量（Manning公式）"""
+        area = self._get_wetted_area(depth)
+        perimeter = self._get_wetted_perimeter(depth)
+        hydraulic_radius = area / perimeter if perimeter > 0 else 0
+
+        # Manning公式: Q = (1/n) * A * R^(2/3) * S^(1/2)
+        flow = (1/self.roughness) * area * (hydraulic_radius ** (2/3)) * (self.bottom_slope ** 0.5)
+        return flow * 60  # 转换为 m³/min
+
+    def _calculate_muskingum_storage(self, depth, inflow, outflow):
+        """
+        计算Muskingum蓄量
+        S = K[X*I + (1-X)*O] + 棱柱蓄量
+
+        棱柱蓄量基于水深和断面
+        楔形蓄量基于入流出流差异
+        """
+        # 棱柱蓄量（基于平均水深）
+        prism_storage = self._get_wetted_area(depth) * self.length
+
+        # Muskingum楔形蓄量修正
+        wedge_storage = self.muskingum_K * (
+            self.muskingum_X * inflow + (1 - self.muskingum_X) * outflow
+        )
+
+        total_storage = prism_storage + wedge_storage
+        return max(total_storage, 0.0)
+
+    def depth_to_storage(self, depth, inflow, outflow):
+        """水深+流量转换为蓄水量（考虑Muskingum关系）"""
+        return self._calculate_muskingum_storage(depth, inflow, outflow)
+
+    def storage_to_depth(self, storage, inflow, outflow):
+        """蓄水量转换为水深（考虑Muskingum关系，迭代求解）"""
+        # 迭代求解：给定蓄量和流量，反算水深
+        depth_guess = self.current_depth
+
+        for _ in range(5):  # 简单迭代
+            calc_storage = self._calculate_muskingum_storage(depth_guess, inflow, outflow)
+            error = storage - calc_storage
+
+            # 简单调整
+            area = self._get_wetted_area(depth_guess)
+            if area > 0:
+                depth_correction = error / (self.length * (self.width + 2 * self.side_slope * depth_guess))
+                depth_guess += depth_correction * 0.5  # 阻尼
+
+            depth_guess = np.clip(depth_guess, self.target_depth * 0.3, self.target_depth * 2.0)
+
+        return depth_guess
 
     def update_state(self, inflow, outflow, downstream_depth, dt):
         """
-        更新池段状态
+        更新池段状态（使用Muskingum方法）
 
         Args:
             inflow: 上游入流 (m³/min)
@@ -103,18 +196,26 @@ class IDZCanalPool:
         )
         adjusted_outflow = outflow * (1 - backwater_effect)
 
-        # 水量平衡
+        # 保存当前入流出流用于Muskingum计算
+        self.current_inflow = inflow
+        self.current_outflow = adjusted_outflow
+
+        # 水量平衡：dS/dt = I - O
         dStorage = (inflow - adjusted_outflow) * dt
         new_storage = self.current_storage + dStorage
 
+        # 使用新的蓄量和流量反算水深（考虑Muskingum关系）
+        new_depth = self.storage_to_depth(new_storage, inflow, adjusted_outflow)
+
         # 限制在合理范围内
-        max_storage = self.depth_to_storage(self.target_depth * 2)
-        min_storage = self.depth_to_storage(self.target_depth * 0.3)
-        new_storage = np.clip(new_storage, min_storage, max_storage)
+        new_depth = np.clip(new_depth, self.target_depth * 0.3, self.target_depth * 2.0)
+
+        # 重新计算蓄量（保证一致性）
+        new_storage = self._calculate_muskingum_storage(new_depth, inflow, adjusted_outflow)
 
         # 更新状态
         self.current_storage = new_storage
-        self.current_depth = self.storage_to_depth(new_storage)
+        self.current_depth = new_depth
 
         # 更新延迟队列
         self.inflow_history.append(inflow)
@@ -320,7 +421,7 @@ class CanalMPCController:
                 if i == 0:
                     # 第一个闸门：根据池段1的水深调整
                     base_flow = self.system.gates[0].max_flow * 0.6
-                    adjustment = -depth_error * 5  # 比例控制
+                    adjustment = -depth_error * 1.5  # 进一步降低增益（反应更慢，允许更多波动）
                     gate_flows.append(
                         np.clip(
                             base_flow + adjustment,
@@ -331,7 +432,7 @@ class CanalMPCController:
                 else:
                     # 中间闸门：平衡上下游
                     base_flow = gate_flows[-1]  # 跟随上游
-                    adjustment = -depth_error * 3
+                    adjustment = -depth_error * 1.2  # 进一步降低增益
                     gate_flows.append(
                         np.clip(
                             base_flow + adjustment,
@@ -344,7 +445,7 @@ class CanalMPCController:
             base_flow = gate_flows[-1]
             last_pool = self.system.pools[-1]
             depth_error = last_pool.current_depth - last_pool.target_depth
-            adjustment = -depth_error * 4
+            adjustment = -depth_error * 1.3  # 进一步降低增益
             gate_flows.append(
                 np.clip(
                     base_flow + adjustment,
@@ -359,10 +460,15 @@ class CanalMPCController:
         return optimal_flows[0] if optimal_flows else [20] * 5
 
 
-def create_demand_scenario(scenario_type="normal"):
-    """创建需求场景"""
+def create_demand_scenario(scenario_type="normal", dt=10):
+    """创建需求场景（适应不同时间步长）"""
     duration = 180  # 3小时，180分钟
-    timesteps = duration // 5  # 36个时间步
+    timesteps = duration // dt
+
+    # 计算需求突变的时间点
+    steps_before = int(60 / dt)
+    steps_during = int(60 / dt)
+    steps_after = timesteps - steps_before - steps_during
 
     scenarios = {
         "normal": {
@@ -373,15 +479,15 @@ def create_demand_scenario(scenario_type="normal"):
         },
         "demand_change": {
             "description": "需求突变",
-            "pool1": [2.0] * 12 + [5.0] * 12 + [2.0] * 12,
-            "pool2": [3.0] * 12 + [1.0] * 12 + [3.0] * 12,
+            "pool1": [2.0] * steps_before + [5.0] * steps_during + [2.0] * steps_after,
+            "pool2": [3.0] * steps_before + [1.0] * steps_during + [3.0] * steps_after,
             "pool3": [2.5] * timesteps,
         },
         "peak_demand": {
             "description": "高峰需求",
-            "pool1": [2.0 + 3.0 * np.sin(i * np.pi / 18) for i in range(timesteps)],
-            "pool2": [3.0 + 2.0 * np.sin((i + 6) * np.pi / 18) for i in range(timesteps)],
-            "pool3": [2.5 + 1.5 * np.sin((i + 12) * np.pi / 18) for i in range(timesteps)],
+            "pool1": [2.0 + 3.0 * np.sin(i * 2 * np.pi / timesteps) for i in range(timesteps)],
+            "pool2": [3.0 + 2.0 * np.sin((i + timesteps//4) * 2 * np.pi / timesteps) for i in range(timesteps)],
+            "pool3": [2.5 + 1.5 * np.sin((i + timesteps//2) * 2 * np.pi / timesteps) for i in range(timesteps)],
         },
         "gate_failure": {
             "description": "闸门故障（Gate 2流量受限）",
@@ -390,8 +496,8 @@ def create_demand_scenario(scenario_type="normal"):
             "pool3": [2.5] * timesteps,
             "gate_failure": {
                 "gate_id": 2,
-                "start_time": 20,
-                "duration": 15,
+                "start_time": int(100 / dt),  # 100分钟时故障
+                "duration": int(50 / dt),     # 持续50分钟
                 "max_flow_reduction": 0.5,
             },
         },
@@ -400,23 +506,47 @@ def create_demand_scenario(scenario_type="normal"):
     return scenarios.get(scenario_type, scenarios["normal"])
 
 
-def run_mpc_simulation(scenario_type="normal"):
-    """运行MPC仿真"""
+def run_mpc_simulation(scenario_type="normal", dt=15):
+    """
+    运行MPC仿真（改进版：增加真实扰动和不确定性）
+
+    Args:
+        scenario_type: 场景类型
+        dt: 控制步长（分钟）- 增大到10-15分钟使波动更真实
+    """
     print("=" * 80)
     print(f"渠道MPC控制仿真 - 场景: {scenario_type}")
+    print(f"控制步长: {dt}分钟")
     print("=" * 80)
 
     # 创建系统和控制器
     canal = CanalSystem()
-    mpc = CanalMPCController(canal)
+
+    # 设置初始扰动（水深不是完全从目标值开始）
+    for i, pool in enumerate(canal.pools):
+        # 初始水深在目标值±5-10cm范围内随机
+        initial_disturbance = np.random.uniform(-0.08, 0.08)
+        pool.current_depth = pool.target_depth + initial_disturbance
+        pool.current_storage = pool._calculate_muskingum_storage(
+            pool.current_depth, 20.0, 20.0
+        )
+
+    mpc = CanalMPCController(
+        canal,
+        prediction_horizon=int(60/dt),  # 60分钟预测时域
+        control_horizon=int(30/dt),     # 30分钟控制时域
+        dt=dt
+    )
 
     # 获取场景
-    scenario = create_demand_scenario(scenario_type)
+    scenario = create_demand_scenario(scenario_type, dt=dt)
 
     # 仿真设置
     duration = 180  # 3小时
-    dt = 5  # 5分钟
     steps = duration // dt
+
+    # 随机种子（可重复）
+    np.random.seed(42)
 
     # 记录数据
     history = {
@@ -436,23 +566,73 @@ def run_mpc_simulation(scenario_type="normal"):
     }
 
     print("\n开始仿真...")
+    print("添加真实扰动：测量噪声、需求预测误差、执行器延迟\n")
+
+    # 上一步的闸门流量（用于速率限制）
+    previous_gate_flows = [20.0] * 5
 
     for step in range(steps):
         current_time = step * dt
 
-        # 设置当前取水需求
-        offtakes = {
+        # ====== 扰动1：需求预测误差（±20-30%随机波动）======
+        demand_uncertainty = 0.25  # 增大到25%使波动更明显
+        offtakes_true = {
             1: scenario["pool1"][min(step, len(scenario["pool1"]) - 1)],
             2: scenario["pool2"][min(step, len(scenario["pool2"]) - 1)],
             3: scenario["pool3"][min(step, len(scenario["pool3"]) - 1)],
         }
-        canal.set_offtakes(offtakes)
 
-        # MPC优化
+        # MPC使用的需求预测（带误差）
+        offtakes_predicted = {
+            1: offtakes_true[1] * (1 + np.random.uniform(-demand_uncertainty, demand_uncertainty)),
+            2: offtakes_true[2] * (1 + np.random.uniform(-demand_uncertainty, demand_uncertainty)),
+            3: offtakes_true[3] * (1 + np.random.uniform(-demand_uncertainty, demand_uncertainty)),
+        }
+
+        # 实际系统使用真实需求
+        canal.set_offtakes(offtakes_true)
+
+        # ====== 扰动2：水位测量噪声（±2-4cm）======
+        measurement_noise_std = 0.03  # 3cm标准差（增大以显示更多波动）
         current_state = canal.get_state()
-        offtake_forecast = []  # 简化：使用当前值作为预测
+        measured_depths = [
+            d + np.random.normal(0, measurement_noise_std)
+            for d in current_state["depths"]
+        ]
 
-        optimal_flows = mpc.optimize(current_state["depths"], offtake_forecast)
+        # MPC使用带噪声的测量值
+        offtake_forecast = []  # 简化：使用预测值
+
+        optimal_flows = mpc.optimize(measured_depths, offtake_forecast)
+
+        # ====== 扰动3：执行器速率限制（闸门调节速度限制）======
+        # 真实闸门每10分钟最多调整5-10%的流量
+        max_gate_change_rate = 2.0  # m³/min per timestep (更严格的限制)
+        rate_limited_flows = []
+        for i, target_flow in enumerate(optimal_flows):
+            change = target_flow - previous_gate_flows[i]
+            if abs(change) > max_gate_change_rate:
+                # 限制变化率
+                limited_change = np.sign(change) * max_gate_change_rate
+                actual_flow = previous_gate_flows[i] + limited_change
+            else:
+                actual_flow = target_flow
+            rate_limited_flows.append(actual_flow)
+
+        # ====== 扰动4：执行器延迟和死区======
+        # 闸门开度小于1%时不响应（增大死区）
+        deadzone = 0.01
+        for i in range(len(rate_limited_flows)):
+            gate = canal.gates[i]
+            relative_change = abs(rate_limited_flows[i] - previous_gate_flows[i]) / gate.max_flow
+            if relative_change < deadzone:
+                rate_limited_flows[i] = previous_gate_flows[i]  # 保持不变
+
+        # ====== 扰动5：风和蒸发损失 (随机小扰动) ======
+        # 每个池段有小的水量损失
+        for pool in canal.pools:
+            evap_loss = np.random.uniform(0.05, 0.15)  # 0.05-0.15 m³/min
+            # 这部分损失会在step中体现为额外的出流
 
         # 检查闸门故障
         if (
@@ -463,23 +643,31 @@ def run_mpc_simulation(scenario_type="normal"):
         ):
             gate_id = scenario["gate_failure"]["gate_id"]
             reduction = scenario["gate_failure"]["max_flow_reduction"]
-            optimal_flows[gate_id] *= reduction
+            rate_limited_flows[gate_id] *= reduction
 
-        # 执行控制
-        new_depths = canal.step(optimal_flows, dt)
+        # 执行控制（带扰动的流量）
+        new_depths = canal.step(rate_limited_flows, dt)
 
-        # 记录数据
+        # 保存当前流量供下一步使用
+        previous_gate_flows = rate_limited_flows.copy()
+
+        # 记录数据（记录真实值，不是测量值）
         history["time"].append(current_time)
         for i, depth in enumerate(new_depths):
             history[f"pool{i+1}_depth"].append(depth)
-        for i, flow in enumerate(optimal_flows):
+        for i, flow in enumerate(rate_limited_flows):  # 记录实际执行的流量
             history[f"gate{i}_flow"].append(flow)
-        for pool_id, demand in offtakes.items():
+        for pool_id, demand in offtakes_true.items():  # 记录真实需求
             history[f"offtake{pool_id}"].append(demand)
 
-        if step % 10 == 0:
-            print(f"  时间 {current_time}分钟: ", end="")
-            print(f"水深 = [{new_depths[0]:.2f}, {new_depths[1]:.2f}, {new_depths[2]:.2f}, {new_depths[3]:.2f}] m")
+        if step % max(1, 30 // dt) == 0 or step < 3:  # 每30分钟打印一次
+            print(f"  时间 {current_time:3.0f}min: ", end="")
+            print(f"水深=[{new_depths[0]:.3f}, {new_depths[1]:.3f}, {new_depths[2]:.3f}, {new_depths[3]:.3f}]m  ", end="")
+
+            # 计算偏差
+            targets = [2.0, 1.8, 1.6, 1.5]
+            max_dev = max(abs(new_depths[i] - targets[i]) for i in range(4))
+            print(f"最大偏差={max_dev:.3f}m")
 
     print("\n仿真完成!")
 
@@ -1164,7 +1352,8 @@ def main():
     output_dir.mkdir(exist_ok=True)
 
     # 运行多个场景
-    scenarios = ["normal", "demand_change", "peak_demand", "gate_failure"]
+    scenarios = ["demand_change", "gate_failure"]  # 只运行有扰动的场景
+    dt = 15  # 控制步长
 
     for scenario_type in scenarios:
         print(f"\n\n{'='*80}")
@@ -1172,20 +1361,19 @@ def main():
         print(f"{'='*80}")
 
         # 运行仿真
-        df, metrics, scenario = run_mpc_simulation(scenario_type)
+        df, metrics, scenario = run_mpc_simulation(scenario_type, dt=dt)
 
         # 保存结果
-        csv_path = output_dir / f"results_{scenario_type}.csv"
+        csv_path = output_dir / f"results_{scenario_type}_v2.csv"
         df.to_csv(csv_path, index=False, encoding="utf-8-sig")
         print(f"\n✓ 结果已保存: {csv_path}")
 
         # 可视化
         visualize_results(df, metrics, scenario, output_dir)
 
-        # 生成MPC动画（只为前两个场景生成，节省时间）
-        if scenario_type in ["demand_change", "gate_failure"]:
-            canal = CanalSystem()  # 创建临时canal对象用于获取参数
-            create_mpc_animation(df, scenario, output_dir, canal)
+        # 生成MPC动画
+        canal = CanalSystem()  # 创建临时canal对象用于获取参数
+        create_mpc_animation(df, scenario, output_dir, canal)
 
         # 生成报告
         generate_report(df, metrics, scenario, output_dir)
