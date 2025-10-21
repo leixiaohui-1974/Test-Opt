@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import copy
+import warnings
 from typing import Dict, Iterable, List, Optional, Tuple, TYPE_CHECKING
 
 from pyomo.environ import (
@@ -29,6 +30,24 @@ from pyomo.environ import (
 
 if TYPE_CHECKING:
     from water_network_schema import EdgeSpec, NetworkConfig, NodeSpec, SeriesSpec
+
+# 导入异常类和验证函数
+try:
+    from .exceptions import ConfigurationError, TimeSeriesError, ValidationError
+    from .validation import validate_network_config
+except ImportError:
+    # 如果无法导入，定义简单版本
+    class ConfigurationError(Exception):
+        pass
+
+    class TimeSeriesError(Exception):
+        pass
+
+    class ValidationError(Exception):
+        pass
+
+    def validate_network_config(config):
+        pass  # 降级处理
 
 
 DEFAULT_SHORTAGE_PENALTY = 1e5
@@ -147,12 +166,34 @@ def build_water_network_model(
     network_cfg: "NetworkConfig",
     *,
     scenario_overrides: Optional[Dict] = None,
+    validate: bool = True,
 ) -> ConcreteModel:
     """
     根据网络配置构建 Pyomo 模型。
+
+    Args:
+        network_cfg: 网络配置字典
+        scenario_overrides: 情景覆盖配置
+        validate: 是否进行配置验证（默认True）
+
+    Returns:
+        ConcreteModel: 构建的Pyomo优化模型
+
+    Raises:
+        ConfigurationError: 配置错误
+        ValidationError: 验证失败
+        TimeSeriesError: 时间序列错误
     """
 
     cfg = _apply_overrides(network_cfg, scenario_overrides or {})
+
+    # 验证配置
+    if validate:
+        try:
+            validate_network_config(cfg)
+        except Exception as e:
+            # 捕获并重新抛出更详细的错误
+            raise type(e)(f"配置验证失败: {str(e)}") from e
     time_index = _resolve_time_index(cfg)
     nodes: List["NodeSpec"] = cfg.get("nodes", [])
     edges: List["EdgeSpec"] = cfg.get("edges", [])
