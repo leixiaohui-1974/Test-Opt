@@ -867,28 +867,28 @@ def create_mpc_animation(df, scenario, output_dir, canal):
                     alpha=0.8
                 )
 
-                # Calculate and plot water usage change on right axis
-                if current_idx > 0:
-                    offtake_change = np.diff(df[f"offtake{pool_idx}"][:current_idx+1])
-                    ax_wc.plot(
-                        times[1:current_idx+1],
-                        offtake_change,
-                        color='purple',
-                        linewidth=2,
-                        label=f"Usage Change",
-                        alpha=0.7,
-                        marker='o',
-                        markersize=3
-                    )
-                    ax_wc.axhline(y=0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
-                    ax_wc.set_ylabel("Water Usage Change (m³/min/step)", fontsize=9, color='purple')
-                    ax_wc.tick_params(axis='y', labelcolor='purple')
+                # Calculate and plot water usage change on right axis (step change from initial value)
+                initial_offtake = df[f"offtake{pool_idx}"].iloc[0]
+                offtake_change = df[f"offtake{pool_idx}"][:current_idx+1] - initial_offtake
+                ax_wc.plot(
+                    times[:current_idx+1],
+                    offtake_change,
+                    color='purple',
+                    linewidth=2,
+                    label=f"Usage Change",
+                    alpha=0.7,
+                    marker='o',
+                    markersize=3
+                )
+                ax_wc.axhline(y=0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
+                ax_wc.set_ylabel("Water Usage Change (m³/min)", fontsize=9, color='purple')
+                ax_wc.tick_params(axis='y', labelcolor='purple')
 
-                    # Set dynamic y-axis range for water usage change
-                    if len(offtake_change) > 0:
-                        change_max = max(abs(offtake_change.min()), abs(offtake_change.max()))
-                        if change_max > 0:
-                            ax_wc.set_ylim(-change_max * 1.2, change_max * 1.2)
+                # Set dynamic y-axis range for water usage change
+                if len(offtake_change) > 0:
+                    change_max = max(abs(offtake_change.min()), abs(offtake_change.max()))
+                    if change_max > 0:
+                        ax_wc.set_ylim(-change_max * 1.2, change_max * 1.2)
 
             # Current time marker
             ax_f.axvline(x=current_time, color='green', linestyle='-', linewidth=2, alpha=0.5)
