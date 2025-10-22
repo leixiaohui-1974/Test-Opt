@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 try:
     from .exceptions import ConfigurationError, TimeSeriesError, ValidationError
     from .validation import validate_network_config
+    from .defaults import OPTIMIZATION_DEFAULTS
+    from .feasibility import check_solver_results
 except ImportError:
     # 如果无法导入，定义简单版本
     class ConfigurationError(Exception):
@@ -49,10 +51,13 @@ except ImportError:
     def validate_network_config(config):
         pass  # 降级处理
 
+    # 如果无法导入defaults，使用硬编码值
+    class _OptimizationDefaults:
+        shortage_penalty = 1e5
+        pump_cost = 200.0
+        idz_slack_penalty = 1e6
 
-DEFAULT_SHORTAGE_PENALTY = 1e5
-DEFAULT_PUMP_COST = 200.0
-DEFAULT_IDZ_SLACK_PENALTY = 1e6
+    OPTIMIZATION_DEFAULTS = _OptimizationDefaults()
 
 
 def _resolve_time_index(network_cfg: "NetworkConfig") -> List[str]:
@@ -443,8 +448,8 @@ def build_water_network_model(
         )
 
     # 目标函数
-    pump_cost_weight = float(weights.get("pumping_cost", DEFAULT_PUMP_COST))
-    shortage_weight = float(weights.get("shortage_penalty", DEFAULT_SHORTAGE_PENALTY))
+    pump_cost_weight = float(weights.get("pumping_cost", OPTIMIZATION_DEFAULTS.pump_cost))
+    shortage_weight = float(weights.get("shortage_penalty", OPTIMIZATION_DEFAULTS.shortage_penalty))
 
     edge_energy_cost = {
         edge["id"]: edge.get("attributes", {}).get("energy_cost", 0.0)

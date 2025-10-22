@@ -9,12 +9,16 @@ from pyomo.environ import SolverFactory, value
 try:
     from .water_network_generic import build_water_network_model
     from .exceptions import SolverError
+    from .feasibility import check_solver_results, FeasibilityStatus
+    from .defaults import MPC_DEFAULTS
 except ImportError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
     from water_network_generic import build_water_network_model
     from exceptions import SolverError
+    from feasibility import check_solver_results, FeasibilityStatus
+    from defaults import MPC_DEFAULTS
 
 
 class MPCController:
@@ -156,6 +160,9 @@ class MPCController:
 
         Returns:
             优化结果字典，包含controls和states
+
+        Raises:
+            SolverError: 当优化问题不可行或求解失败时
         """
         # 创建MPC配置
         mpc_config = self._create_mpc_config(current_states, self.current_step)
@@ -166,18 +173,35 @@ class MPCController:
         try:
             results = self.solver.solve(model, tee=False, options=self.solver_options)
 
-            from pyomo.opt import TerminationCondition
+            # 检查求解结果的可行性
+            feasibility_result = check_solver_results(results, model)
 
-            if results.solver.termination_condition != TerminationCondition.optimal:
-                raise SolverError(
-                    f"MPC求解失败: {results.solver.termination_condition}"
+            if not feasibility_result.is_feasible:
+                # 问题不可行，抛出详细错误
+                error_msg = (
+                    f"MPC求解在时间步 {self.current_step} 失败: "
+                    f"{feasibility_result.message}\n"
+                    f"详细信息: {feasibility_result.details}"
                 )
+                raise SolverError(error_msg)
 
+            # 检查是否有警告（例如达到时间限制但找到可行解）
+            if feasibility_result.status == FeasibilityStatus.FEASIBLE and "max" in feasibility_result.message.lower():
+                import warnings
+                warnings.warn(f"MPC求解警告: {feasibility_result.message}")
+
+        except SolverError:
+            # 重新抛出SolverError
+            raise
         except Exception as e:
             raise SolverError(f"MPC求解错误: {str(e)}") from e
 
         # 提取解
         solution = self._extract_solution(model, mpc_config)
+
+        # 添加可行性状态到解中
+        solution["feasibility_status"] = feasibility_result.status.value
+        solution["feasibility_message"] = feasibility_result.message
 
         # 更新历史
         self.state_history.append(solution["states"])
