@@ -677,16 +677,15 @@ def create_mpc_animation(df, scenario, output_dir, canal):
         depth_margin = max(0.05, (depth_max - depth_min) * 0.2)  # At least 5cm margin, or 20% of range
         depth_ranges.append((depth_min - depth_margin, depth_max + depth_margin))
 
-        # Calculate flow range for this pool (inflow gate i, outflow gate i+1, offtake if exists)
+        # Calculate flow range for this pool - ONLY use gate flows (exclude offtake for tighter range)
+        # This makes gate flow variations more visible
         flows = []
         flows.extend(df[f"gate{i}_flow"].values)
         flows.extend(df[f"gate{i+1}_flow"].values)
-        if pool_idx in [1, 2, 3]:
-            flows.extend(df[f"offtake{pool_idx}"].values)
 
         flow_min = min(flows)
         flow_max = max(flows)
-        flow_margin = max(1.0, (flow_max - flow_min) * 0.15)  # At least 1 m³/min margin, or 15% of range
+        flow_margin = max(0.5, (flow_max - flow_min) * 0.1)  # Reduced margin: 0.5 m³/min or 10% of range
         flow_ranges.append((flow_min - flow_margin, flow_max + flow_margin))
 
     # Create figure with 4 rows x 2 columns layout
