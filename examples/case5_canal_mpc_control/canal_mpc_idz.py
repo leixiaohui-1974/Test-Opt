@@ -773,13 +773,16 @@ def create_mpc_animation(df, scenario, output_dir, canal):
 
     # Create subplots: 4 rows (one per pool), 2 columns (depth, flow)
     axes_depth = []  # Left column: depth plots
-    axes_flow = []   # Right column: flow plots
+    axes_flow = []   # Right column: flow plots (left y-axis)
+    axes_water_change = []  # Right column: water usage change plots (right y-axis)
 
     for i in range(4):
         ax_d = fig.add_subplot(gs[i, 0])  # Depth subplot
         ax_f = fig.add_subplot(gs[i, 1])  # Flow subplot
+        ax_wc = ax_f.twinx()  # Water usage change (right y-axis)
         axes_depth.append(ax_d)
         axes_flow.append(ax_f)
+        axes_water_change.append(ax_wc)
 
     # Update function (called for each frame)
     def update(frame):
@@ -787,7 +790,7 @@ def create_mpc_animation(df, scenario, output_dir, canal):
         current_time = times[current_idx]
 
         # Clear all subplots
-        for ax in axes_depth + axes_flow:
+        for ax in axes_depth + axes_flow + axes_water_change:
             ax.clear()
 
         # Colors for each pool
@@ -830,6 +833,7 @@ def create_mpc_animation(df, scenario, output_dir, canal):
 
             # === Right subplot: Flow rates ===
             ax_f = axes_flow[i]
+            ax_wc = axes_water_change[i]
 
             # Upstream gate (inflow)
             ax_f.plot(
@@ -851,7 +855,7 @@ def create_mpc_animation(df, scenario, output_dir, canal):
                 alpha=0.8
             )
 
-            # Offtake demand (if exists)
+            # Offtake demand (if exists) - plot on left axis
             if pool_idx in [1, 2, 3]:
                 ax_f.plot(
                     times[:current_idx+1],
@@ -863,6 +867,29 @@ def create_mpc_animation(df, scenario, output_dir, canal):
                     alpha=0.8
                 )
 
+                # Calculate and plot water usage change on right axis
+                if current_idx > 0:
+                    offtake_change = np.diff(df[f"offtake{pool_idx}"][:current_idx+1])
+                    ax_wc.plot(
+                        times[1:current_idx+1],
+                        offtake_change,
+                        color='purple',
+                        linewidth=2,
+                        label=f"Usage Change",
+                        alpha=0.7,
+                        marker='o',
+                        markersize=3
+                    )
+                    ax_wc.axhline(y=0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
+                    ax_wc.set_ylabel("Water Usage Change (m³/min/step)", fontsize=9, color='purple')
+                    ax_wc.tick_params(axis='y', labelcolor='purple')
+
+                    # Set dynamic y-axis range for water usage change
+                    if len(offtake_change) > 0:
+                        change_max = max(abs(offtake_change.min()), abs(offtake_change.max()))
+                        if change_max > 0:
+                            ax_wc.set_ylim(-change_max * 1.2, change_max * 1.2)
+
             # Current time marker
             ax_f.axvline(x=current_time, color='green', linestyle='-', linewidth=2, alpha=0.5)
 
@@ -870,9 +897,13 @@ def create_mpc_animation(df, scenario, output_dir, canal):
             ax_f.set_ylim(flow_ranges[i][0], flow_ranges[i][1])
             ax_f.set_xlim(0, times[-1])
             ax_f.set_ylabel("Flow (m³/min)", fontsize=10)
-            ax_f.set_title(f"Pool {pool_idx} - Flow Rates", fontsize=11, fontweight='bold')
+            ax_f.set_title(f"Pool {pool_idx} - Flow Rates & Water Usage Change", fontsize=11, fontweight='bold')
             ax_f.grid(True, alpha=0.3)
-            ax_f.legend(loc='upper right', fontsize=8)
+
+            # Combine legends from both axes
+            lines1, labels1 = ax_f.get_legend_handles_labels()
+            lines2, labels2 = ax_wc.get_legend_handles_labels()
+            ax_f.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
 
             if i == 3:  # Only show x-label on bottom plot
                 ax_f.set_xlabel("Time (min)", fontsize=10)
