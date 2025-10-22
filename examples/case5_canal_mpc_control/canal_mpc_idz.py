@@ -466,7 +466,11 @@ def visualize_results(df, metrics, scenario, output_dir):
 
     # Top right: Gate flow control (showing MPC feedforward control)
     ax = fig.add_subplot(gs[0, 1])
+
+    # Calculate dynamic y-axis range for gate flows
+    all_gate_flows = []
     for i in range(5):
+        all_gate_flows.extend(df[f"gate{i}_flow"].values)
         ax.plot(df["time"], df[f"gate{i}_flow"], label=f"Gate {i}", linewidth=2, alpha=0.8)
 
     # Add demand change event marker
@@ -474,8 +478,12 @@ def visualize_results(df, metrics, scenario, output_dir):
         ax.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
                   alpha=0.8, label='Demand Change')
 
-    # Fixed y-axis range
-    ax.set_ylim(0, 45)
+    # Dynamic y-axis range based on actual gate flow data
+    gate_flow_min = min(all_gate_flows)
+    gate_flow_max = max(all_gate_flows)
+    gate_flow_margin = max(1.0, (gate_flow_max - gate_flow_min) * 0.15)
+    ax.set_ylim(gate_flow_min - gate_flow_margin, gate_flow_max + gate_flow_margin)
+
     ax.set_xlabel("Time (min)", fontsize=10)
     ax.set_ylabel("Flow Rate (m³/min)", fontsize=10)
     ax.set_title("Gate Flow Control (MPC Feedforward)", fontsize=11, fontweight="bold")
@@ -574,10 +582,20 @@ def visualize_results(df, metrics, scenario, output_dir):
         ax_zoom_flow.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=3,
                             alpha=0.9, label='Demand Change Event')
 
-        # Annotations
+        # Calculate dynamic y-axis range for flow (only gate flows for tighter range)
+        zoom_gate_flows = []
+        zoom_gate_flows.extend(df_zoom["gate0_flow"].values)
+        zoom_gate_flows.extend(df_zoom["gate1_flow"].values)
+        zoom_flow_min = min(zoom_gate_flows)
+        zoom_flow_max = max(zoom_gate_flows)
+        zoom_flow_margin = max(1.0, (zoom_flow_max - zoom_flow_min) * 0.2)
+        ax_zoom_flow.set_ylim(zoom_flow_min - zoom_flow_margin, zoom_flow_max + zoom_flow_margin)
+
+        # Annotations with dynamic positioning
+        flow_mid = (zoom_flow_min + zoom_flow_max) / 2
         ax_zoom_flow.annotate('MPC anticipates\nand acts early',
-                             xy=(demand_change_time-5, 20),
-                             xytext=(demand_change_time-20, 25),
+                             xy=(demand_change_time-5, flow_mid),
+                             xytext=(demand_change_time-20, flow_mid + zoom_flow_margin * 0.5),
                              arrowprops=dict(arrowstyle='->', color='green', lw=2),
                              fontsize=10, color='green', fontweight='bold',
                              bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
