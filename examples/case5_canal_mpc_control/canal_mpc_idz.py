@@ -442,8 +442,8 @@ def calculate_performance_metrics(df, canal):
 def visualize_results(df, metrics, scenario, output_dir):
     """Visualize MPC simulation results (Improved: show MPC predictive control with event markers and zoom-in)"""
 
-    fig = plt.figure(figsize=(20, 20))  # Increased height for 6 rows
-    gs = fig.add_gridspec(6, 2, hspace=0.35, wspace=0.25)
+    fig = plt.figure(figsize=(20, 24))  # Increased height for better zoom view
+    gs = fig.add_gridspec(7, 2, hspace=0.35, wspace=0.25)
 
     scenario_desc = scenario.get("description", "Unknown")
     fig.suptitle(f"Canal MPC Control Simulation Results - {scenario_desc}", fontsize=16, fontweight="bold")
@@ -586,10 +586,8 @@ def visualize_results(df, metrics, scenario, output_dir):
     ax.legend(loc="best", fontsize=8, ncol=3)
     ax.grid(True, alpha=0.3)
 
-    # === NEW: Zoomed-in view of key time window ===
+    # === NEW: Zoomed-in view of key time window - Redesigned for clarity ===
     if demand_change_time is not None or demand_change_times:
-        ax_zoom = fig.add_subplot(gs[4, :])
-
         # Filter data for zoom window (wider window for cascading scenario)
         if demand_change_times:
             zoom_start, zoom_end = 45, 120  # Wider window to show all cascading events
@@ -598,87 +596,99 @@ def visualize_results(df, metrics, scenario, output_dir):
         mask = (df["time"] >= zoom_start) & (df["time"] <= zoom_end)
         df_zoom = df[mask]
 
-        # Create twin axes for different scales
-        ax_zoom_flow = ax_zoom
-        ax_zoom_depth = ax_zoom.twinx()
+        # === Upper subplot: Water usage changes (Input disturbances) ===
+        ax_zoom_top = fig.add_subplot(gs[4, :])
 
-        # Plot offtake demand (step change) - LEFT Y-AXIS
-        ax_zoom_flow.plot(df_zoom["time"], df_zoom["offtake1"],
-                         color='red', linestyle='--', linewidth=3, marker='s', markersize=5,
-                         label='Offtake 1 (Demand)', alpha=0.8)
-        ax_zoom_flow.plot(df_zoom["time"], df_zoom["offtake2"],
-                         color='darkred', linestyle='--', linewidth=3, marker='s', markersize=5,
-                         label='Offtake 2 (Demand)', alpha=0.8)
+        # Calculate initial offtake values for change calculation
+        initial_offtakes = {
+            1: df["offtake1"].iloc[0],
+            2: df["offtake2"].iloc[0],
+            3: df["offtake3"].iloc[0]
+        }
 
-        # Plot gate response (MPC action) - LEFT Y-AXIS
-        ax_zoom_flow.plot(df_zoom["time"], df_zoom["gate0_flow"],
-                         color='green', linewidth=2.5, marker='o', markersize=4,
-                         label='Gate 0 (MPC Action)', alpha=0.9)
-        ax_zoom_flow.plot(df_zoom["time"], df_zoom["gate1_flow"],
-                         color='blue', linewidth=2.5, marker='o', markersize=4,
-                         label='Gate 1 (MPC Action)', alpha=0.9)
+        # Plot offtake changes as step functions
+        for pool_id, color, linestyle in [(1, '#FF4444', '-'), (2, '#CC0000', '--'), (3, '#990000', '-.')]:
+            offtake_change = df_zoom[f"offtake{pool_id}"] - initial_offtakes[pool_id]
+            ax_zoom_top.plot(df_zoom["time"], offtake_change,
+                           color=color, linestyle=linestyle, linewidth=3,
+                           label=f'Pool {pool_id} Usage Change', alpha=0.85,
+                           marker='s', markersize=4, markevery=2)
 
-        # Plot water depth response - RIGHT Y-AXIS
-        ax_zoom_depth.plot(df_zoom["time"], df_zoom["pool1_depth"],
-                          color='purple', linewidth=2.5, linestyle='-', marker='^', markersize=4,
-                          label='Pool 1 Depth (Response)', alpha=0.8)
-
-        # Event marker(s)
+        # Event markers
         if demand_change_times:
             for idx, t in enumerate(demand_change_times):
-                label = 'Demand Change Events' if idx == 0 else ''
-                ax_zoom_flow.axvline(x=t, color='orange', linestyle=':', linewidth=3,
-                                    alpha=0.9, label=label)
+                ax_zoom_top.axvline(x=t, color='orange', linestyle=':', linewidth=2.5,
+                                  alpha=0.8, label='Events' if idx == 0 else '')
         elif demand_change_time is not None:
-            ax_zoom_flow.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=3,
-                                alpha=0.9, label='Demand Change Event')
+            ax_zoom_top.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
+                              alpha=0.8, label='Event')
 
-        # Calculate dynamic y-axis range for flow (only gate flows for tighter range)
-        zoom_gate_flows = []
-        zoom_gate_flows.extend(df_zoom["gate0_flow"].values)
-        zoom_gate_flows.extend(df_zoom["gate1_flow"].values)
-        zoom_flow_min = min(zoom_gate_flows)
-        zoom_flow_max = max(zoom_gate_flows)
-        zoom_flow_margin = max(1.0, (zoom_flow_max - zoom_flow_min) * 0.2)
-        ax_zoom_flow.set_ylim(zoom_flow_min - zoom_flow_margin, zoom_flow_max + zoom_flow_margin)
+        ax_zoom_top.axhline(y=0, color='gray', linestyle='-', linewidth=1.5, alpha=0.5)
+        ax_zoom_top.set_ylabel("Water Usage Change\n(m³/min)", fontsize=11, fontweight='bold')
+        ax_zoom_top.set_title(f"Zoomed View: Water Demand Changes vs. MPC Gate Control Response ({zoom_start}-{zoom_end} min)",
+                             fontsize=12, fontweight="bold")
+        ax_zoom_top.legend(loc='upper left', fontsize=9, ncol=2)
+        ax_zoom_top.grid(True, alpha=0.3, linestyle=':')
+        ax_zoom_top.set_xlim(zoom_start, zoom_end)
 
-        # Annotations with dynamic positioning
-        flow_mid = (zoom_flow_min + zoom_flow_max) / 2
+        # Annotate step changes
         if demand_change_times:
-            # For cascading scenario, annotate the sequential control effect
-            ax_zoom_flow.annotate('MPC coordinates\nsequential adjustments',
-                                 xy=(75, flow_mid),
-                                 xytext=(100, flow_mid + zoom_flow_margin * 0.5),
-                                 arrowprops=dict(arrowstyle='->', color='green', lw=2),
-                                 fontsize=10, color='green', fontweight='bold',
-                                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
+            ax_zoom_top.annotate('Input: Cascading\nDemand Changes',
+                               xy=(75, 2), xytext=(85, 3.5),
+                               arrowprops=dict(arrowstyle='->', color='red', lw=2),
+                               fontsize=9, color='red', fontweight='bold',
+                               bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7))
+
+        # Remove x-axis labels for top plot
+        ax_zoom_top.set_xticklabels([])
+
+        # === Lower subplot: Gate flow changes (MPC control response) ===
+        ax_zoom_bot = fig.add_subplot(gs[5, :])
+
+        # Calculate initial gate flows for change calculation
+        initial_gates = {
+            0: df["gate0_flow"].iloc[0],
+            1: df["gate1_flow"].iloc[0],
+            2: df["gate2_flow"].iloc[0],
+            3: df["gate3_flow"].iloc[0],
+            4: df["gate4_flow"].iloc[0]
+        }
+
+        # Plot gate flow changes
+        gate_colors = ['#00AA00', '#0088FF', '#8800FF', '#FF8800', '#00AAAA']
+        for gate_id in range(5):
+            gate_change = df_zoom[f"gate{gate_id}_flow"] - initial_gates[gate_id]
+            ax_zoom_bot.plot(df_zoom["time"], gate_change,
+                           color=gate_colors[gate_id], linewidth=2.5,
+                           label=f'Gate {gate_id}', alpha=0.8,
+                           marker='o', markersize=3, markevery=2)
+
+        # Event markers
+        if demand_change_times:
+            for idx, t in enumerate(demand_change_times):
+                ax_zoom_bot.axvline(x=t, color='orange', linestyle=':', linewidth=2.5,
+                                  alpha=0.8)
         elif demand_change_time is not None:
-            ax_zoom_flow.annotate('MPC anticipates\nand acts early',
-                                 xy=(demand_change_time-5, flow_mid),
-                                 xytext=(demand_change_time-20, flow_mid + zoom_flow_margin * 0.5),
-                                 arrowprops=dict(arrowstyle='->', color='green', lw=2),
-                                 fontsize=10, color='green', fontweight='bold',
-                                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
+            ax_zoom_bot.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
+                              alpha=0.8)
 
-        # Labels and formatting
-        ax_zoom_flow.set_xlabel("Time (min)", fontsize=11, fontweight='bold')
-        ax_zoom_flow.set_ylabel("Flow Rate (m³/min)", fontsize=11, color='black')
-        ax_zoom_depth.set_ylabel("Water Depth (m)", fontsize=11, color='purple')
+        ax_zoom_bot.axhline(y=0, color='gray', linestyle='-', linewidth=1.5, alpha=0.5)
+        ax_zoom_bot.set_xlabel("Time (min)", fontsize=11, fontweight='bold')
+        ax_zoom_bot.set_ylabel("Gate Flow Change\n(m³/min)", fontsize=11, fontweight='bold')
+        ax_zoom_bot.legend(loc='upper left', fontsize=9, ncol=3)
+        ax_zoom_bot.grid(True, alpha=0.3, linestyle=':')
+        ax_zoom_bot.set_xlim(zoom_start, zoom_end)
 
-        title_text = f"Zoomed View: MPC Predictive Control in Action ({zoom_start}-{zoom_end} min)"
-        ax_zoom_flow.set_title(title_text, fontsize=12, fontweight="bold")
-
-        # Legends
-        lines1, labels1 = ax_zoom_flow.get_legend_handles_labels()
-        lines2, labels2 = ax_zoom_depth.get_legend_handles_labels()
-        ax_zoom_flow.legend(lines1 + lines2, labels1 + labels2,
-                           loc='upper left', fontsize=9, ncol=2)
-
-        ax_zoom_flow.grid(True, alpha=0.3, linestyle=':')
-        ax_zoom_flow.set_xlim(zoom_start, zoom_end)
+        # Annotate MPC response
+        if demand_change_times:
+            ax_zoom_bot.annotate('Output: MPC adjusts\ngates proactively',
+                               xy=(70, -1), xytext=(90, -3),
+                               arrowprops=dict(arrowstyle='->', color='green', lw=2),
+                               fontsize=9, color='green', fontweight='bold',
+                               bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7))
 
     # Performance metrics summary
-    ax = fig.add_subplot(gs[5, :])
+    ax = fig.add_subplot(gs[6, :])
     ax.axis("off")
 
     # Create performance metrics table
