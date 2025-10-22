@@ -663,6 +663,32 @@ def create_mpc_animation(df, scenario, output_dir, canal):
     times = df["time"].values
     pool_targets = [2.0, 1.8, 1.6, 1.5]  # Target depths for each pool
 
+    # Pre-calculate dynamic y-axis ranges for each pool to show variations clearly
+    depth_ranges = []
+    flow_ranges = []
+
+    for i in range(4):
+        pool_idx = i + 1
+
+        # Calculate depth range (use actual data range with small margin)
+        depth_data = df[f"pool{pool_idx}_depth"].values
+        depth_min = depth_data.min()
+        depth_max = depth_data.max()
+        depth_margin = max(0.05, (depth_max - depth_min) * 0.2)  # At least 5cm margin, or 20% of range
+        depth_ranges.append((depth_min - depth_margin, depth_max + depth_margin))
+
+        # Calculate flow range for this pool (inflow gate i, outflow gate i+1, offtake if exists)
+        flows = []
+        flows.extend(df[f"gate{i}_flow"].values)
+        flows.extend(df[f"gate{i+1}_flow"].values)
+        if pool_idx in [1, 2, 3]:
+            flows.extend(df[f"offtake{pool_idx}"].values)
+
+        flow_min = min(flows)
+        flow_max = max(flows)
+        flow_margin = max(1.0, (flow_max - flow_min) * 0.15)  # At least 1 m³/min margin, or 15% of range
+        flow_ranges.append((flow_min - flow_margin, flow_max + flow_margin))
+
     # Create figure with 4 rows x 2 columns layout
     fig = plt.figure(figsize=(18, 16))
     gs = fig.add_gridspec(4, 2, hspace=0.3, wspace=0.25)
@@ -713,8 +739,8 @@ def create_mpc_animation(df, scenario, output_dir, canal):
             # Current time marker
             ax_d.axvline(x=current_time, color='green', linestyle='-', linewidth=2, alpha=0.5)
 
-            # Set zoomed y-axis: target ± 0.15m
-            ax_d.set_ylim(target - 0.15, target + 0.15)
+            # Set dynamic y-axis range to emphasize variations
+            ax_d.set_ylim(depth_ranges[i][0], depth_ranges[i][1])
             ax_d.set_xlim(0, times[-1])
             ax_d.set_ylabel("Depth (m)", fontsize=10)
             ax_d.set_title(f"Pool {pool_idx} - Depth (Target: {target}m)", fontsize=11, fontweight='bold')
@@ -762,7 +788,8 @@ def create_mpc_animation(df, scenario, output_dir, canal):
             # Current time marker
             ax_f.axvline(x=current_time, color='green', linestyle='-', linewidth=2, alpha=0.5)
 
-            # Auto-scale y-axis to show variation clearly
+            # Set dynamic y-axis range to emphasize variations
+            ax_f.set_ylim(flow_ranges[i][0], flow_ranges[i][1])
             ax_f.set_xlim(0, times[-1])
             ax_f.set_ylabel("Flow (m³/min)", fontsize=10)
             ax_f.set_title(f"Pool {pool_idx} - Flow Rates", fontsize=11, fontweight='bold')
