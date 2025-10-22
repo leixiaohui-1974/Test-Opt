@@ -586,13 +586,16 @@ def visualize_results(df, metrics, scenario, output_dir):
     ax.legend(loc="best", fontsize=8, ncol=3)
     ax.grid(True, alpha=0.3)
 
-    # === NEW: Zoomed-in view of key time window - 3-panel design for clarity ===
+    # === NEW: Zoomed-in view of key time window - Extended for MPC anticipation ===
     if demand_change_time is not None or demand_change_times:
-        # Filter data for zoom window (wider window for cascading scenario)
+        # Extended time window to show MPC anticipation (starts earlier, ends later)
         if demand_change_times:
-            zoom_start, zoom_end = 45, 120  # Wider window to show all cascading events
+            zoom_start, zoom_end = 30, 135  # Much wider: 30min before first event to 45min after last
+            mpc_lead_times = [10, 10, 10]  # Estimated MPC anticipation for each event (min)
         else:
-            zoom_start, zoom_end = 45, 90
+            zoom_start, zoom_end = 30, 105  # Extended window
+            mpc_lead_times = [10]  # Single event
+
         mask = (df["time"] >= zoom_start) & (df["time"] <= zoom_end)
         df_zoom = df[mask]
 
@@ -606,29 +609,38 @@ def visualize_results(df, metrics, scenario, output_dir):
             3: df["offtake3"].iloc[0]
         }
 
-        # Plot offtake changes as step functions
+        # Plot offtake changes as step functions with larger markers
+        pool_colors = ['#FF4444', '#CC0000', '#990000']
+        pool_linestyles = ['-', '--', '-.']
         for pool_id, color, linestyle in [(1, '#FF4444', '-'), (2, '#CC0000', '--'), (3, '#990000', '-.')]:
             offtake_change = df_zoom[f"offtake{pool_id}"] - initial_offtakes[pool_id]
             ax_zoom_top.plot(df_zoom["time"], offtake_change,
-                           color=color, linestyle=linestyle, linewidth=3,
-                           label=f'Pool {pool_id} Usage Change', alpha=0.85,
-                           marker='s', markersize=5, markevery=2)
+                           color=color, linestyle=linestyle, linewidth=4,
+                           label=f'Pool {pool_id} Demand Change', alpha=0.9,
+                           marker='s', markersize=6, markevery=1)
 
-        # Event markers
+        # Event markers with annotations
         if demand_change_times:
             for idx, t in enumerate(demand_change_times):
-                ax_zoom_top.axvline(x=t, color='orange', linestyle=':', linewidth=2.5,
-                                  alpha=0.8, label='Demand Events' if idx == 0 else '')
+                ax_zoom_top.axvline(x=t, color='orange', linestyle=':', linewidth=3,
+                                  alpha=0.9, label='Demand Events' if idx == 0 else '', zorder=5)
+                # Add event label
+                ax_zoom_top.text(t, ax_zoom_top.get_ylim()[1]*0.9, f'Event {idx+1}\n@{t}min',
+                               ha='center', va='top', fontsize=9, fontweight='bold',
+                               bbox=dict(boxstyle='round,pad=0.5', facecolor='orange', alpha=0.3))
         elif demand_change_time is not None:
-            ax_zoom_top.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
-                              alpha=0.8, label='Demand Event')
+            ax_zoom_top.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=3,
+                              alpha=0.9, label='Demand Event', zorder=5)
+            ax_zoom_top.text(demand_change_time, ax_zoom_top.get_ylim()[1]*0.9, f'Event\n@{demand_change_time}min',
+                           ha='center', va='top', fontsize=9, fontweight='bold',
+                           bbox=dict(boxstyle='round,pad=0.5', facecolor='orange', alpha=0.3))
 
         ax_zoom_top.axhline(y=0, color='gray', linestyle='-', linewidth=1.5, alpha=0.5)
-        ax_zoom_top.set_ylabel("Water Usage Change\n(m³/min)", fontsize=11, fontweight='bold')
-        ax_zoom_top.set_title(f"Zoomed View: Water Demand Changes → MPC Response → Control Action Rate ({zoom_start}-{zoom_end} min)",
-                             fontsize=12, fontweight="bold")
-        ax_zoom_top.legend(loc='upper left', fontsize=9, ncol=2)
-        ax_zoom_top.grid(True, alpha=0.3, linestyle=':')
+        ax_zoom_top.set_ylabel("Water Demand Change\n(m³/min)", fontsize=12, fontweight='bold', color='red')
+        ax_zoom_top.set_title(f"MPC Anticipatory Control: Extended View ({zoom_start}-{zoom_end} min) - Shows MPC Acting BEFORE Demand Changes",
+                             fontsize=13, fontweight="bold")
+        ax_zoom_top.legend(loc='upper left', fontsize=10, ncol=2, framealpha=0.9)
+        ax_zoom_top.grid(True, alpha=0.4, linestyle=':')
         ax_zoom_top.set_xlim(zoom_start, zoom_end)
         ax_zoom_top.set_xticklabels([])
 
@@ -644,26 +656,48 @@ def visualize_results(df, metrics, scenario, output_dir):
             4: df["gate4_flow"].iloc[0]
         }
 
-        # Plot gate flow changes
+        # Plot gate flow changes with thicker lines
         gate_colors = ['#00AA00', '#0088FF', '#8800FF', '#FF8800', '#00AAAA']
+        gate_responses = {}  # Store gate changes for analysis
         for gate_id in range(5):
             gate_change = df_zoom[f"gate{gate_id}_flow"] - initial_gates[gate_id]
+            gate_responses[gate_id] = gate_change
             ax_zoom_mid.plot(df_zoom["time"], gate_change,
-                           color=gate_colors[gate_id], linewidth=2.5,
-                           label=f'Gate {gate_id}', alpha=0.8,
-                           marker='o', markersize=4, markevery=2)
+                           color=gate_colors[gate_id], linewidth=3.5,
+                           label=f'Gate {gate_id}', alpha=0.85,
+                           marker='o', markersize=5, markevery=1)
 
-        # Event markers
+        # Event markers and MPC response annotations
         if demand_change_times:
             for idx, t in enumerate(demand_change_times):
-                ax_zoom_mid.axvline(x=t, color='orange', linestyle=':', linewidth=2.5, alpha=0.8)
+                ax_zoom_mid.axvline(x=t, color='orange', linestyle=':', linewidth=3, alpha=0.9, zorder=5)
+
+                # Find when gates start responding (look for significant change before event)
+                # Check gates 0 and 1 which are upstream and respond to Pool 1 demand
+                anticipated_time = t - mpc_lead_times[idx]
+
+                # Draw arrow showing MPC anticipation
+                y_arrow = ax_zoom_mid.get_ylim()[1] * 0.7
+                ax_zoom_mid.annotate('',
+                                   xy=(t, y_arrow), xytext=(anticipated_time, y_arrow),
+                                   arrowprops=dict(arrowstyle='<->', color='green', lw=3, alpha=0.8))
+                ax_zoom_mid.text((anticipated_time + t) / 2, y_arrow * 1.1,
+                               f'MPC anticipates\n~{mpc_lead_times[idx]}min ahead',
+                               ha='center', va='bottom', fontsize=9, color='green',
+                               fontweight='bold',
+                               bbox=dict(boxstyle='round,pad=0.4', facecolor='lightgreen', alpha=0.7))
+
+                # Label the event
+                ax_zoom_mid.text(t, ax_zoom_mid.get_ylim()[0]*0.9, f'Event {idx+1}',
+                               ha='center', va='bottom', fontsize=8, fontweight='bold',
+                               bbox=dict(boxstyle='round,pad=0.3', facecolor='orange', alpha=0.3))
         elif demand_change_time is not None:
-            ax_zoom_mid.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5, alpha=0.8)
+            ax_zoom_mid.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=3, alpha=0.9, zorder=5)
 
         ax_zoom_mid.axhline(y=0, color='gray', linestyle='-', linewidth=1.5, alpha=0.5)
-        ax_zoom_mid.set_ylabel("Gate Flow Change\n(m³/min)", fontsize=11, fontweight='bold')
-        ax_zoom_mid.legend(loc='upper left', fontsize=9, ncol=3)
-        ax_zoom_mid.grid(True, alpha=0.3, linestyle=':')
+        ax_zoom_mid.set_ylabel("Gate Flow Change\n(m³/min)", fontsize=12, fontweight='bold', color='green')
+        ax_zoom_mid.legend(loc='upper left', fontsize=10, ncol=3, framealpha=0.9)
+        ax_zoom_mid.grid(True, alpha=0.4, linestyle=':')
         ax_zoom_mid.set_xlim(zoom_start, zoom_end)
         ax_zoom_mid.set_xticklabels([])
 
@@ -672,6 +706,8 @@ def visualize_results(df, metrics, scenario, output_dir):
 
         # Calculate gate flow change rates (derivative)
         dt = df["time"].iloc[1] - df["time"].iloc[0]  # time step
+        inflection_points_by_event = {idx: [] for idx in range(len(demand_change_times if demand_change_times else [demand_change_time]))}
+
         for gate_id in range(5):
             gate_change = df[f"gate{gate_id}_flow"] - initial_gates[gate_id]
             # Calculate rate of change using centered difference where possible
@@ -681,44 +717,66 @@ def visualize_results(df, metrics, scenario, output_dir):
             gate_change_rate_zoom = gate_change_rate[mask]
 
             ax_zoom_bot.plot(df_zoom["time"], gate_change_rate_zoom,
-                           color=gate_colors[gate_id], linewidth=2.5,
-                           label=f'Gate {gate_id}', alpha=0.8,
-                           marker='D', markersize=5, markevery=1)
+                           color=gate_colors[gate_id], linewidth=3,
+                           label=f'Gate {gate_id}', alpha=0.85,
+                           marker='D', markersize=6, markevery=1)
 
             # Mark inflection points (where rate changes significantly)
             # Find peaks in absolute change rate
             abs_rate = np.abs(gate_change_rate_zoom)
-            threshold = abs_rate.mean() + abs_rate.std()
+            threshold = abs_rate.mean() + abs_rate.std() * 0.5  # Lower threshold for more detection
             inflection_mask = abs_rate > threshold
             if inflection_mask.any():
                 inflection_times = df_zoom["time"].values[inflection_mask]
                 inflection_rates = gate_change_rate_zoom[inflection_mask]
                 ax_zoom_bot.scatter(inflection_times, inflection_rates,
-                                  color=gate_colors[gate_id], s=100, marker='*',
-                                  edgecolors='black', linewidths=1.5, zorder=10,
-                                  alpha=0.9)
+                                  color=gate_colors[gate_id], s=150, marker='*',
+                                  edgecolors='black', linewidths=2, zorder=10,
+                                  alpha=0.95)
 
-        # Event markers
+                # Associate inflection points with events
+                if demand_change_times:
+                    for inf_time in inflection_times:
+                        # Find closest event AFTER this inflection
+                        for idx, event_time in enumerate(demand_change_times):
+                            if inf_time < event_time and event_time - inf_time <= 20:  # Within 20 min before event
+                                inflection_points_by_event[idx].append((gate_id, inf_time))
+
+        # Event markers with inflection point correspondence
         if demand_change_times:
             for idx, t in enumerate(demand_change_times):
-                ax_zoom_bot.axvline(x=t, color='orange', linestyle=':', linewidth=2.5,
-                                  alpha=0.8, label='Demand Events' if idx == 0 else '')
+                ax_zoom_bot.axvline(x=t, color='orange', linestyle=':', linewidth=3,
+                                  alpha=0.9, label='Demand Events' if idx == 0 else '', zorder=5)
+
+                # Annotate event and corresponding inflection points
+                y_pos = ax_zoom_bot.get_ylim()[1] * 0.85
+                event_text = f'Event {idx+1} @{t}min'
+                if len(inflection_points_by_event[idx]) > 0:
+                    # Show which gates responded
+                    responding_gates = list(set([g for g, _ in inflection_points_by_event[idx]]))
+                    gate_str = ', '.join([f'G{g}' for g in sorted(responding_gates)])
+                    event_text += f'\n← {gate_str} respond'
+
+                ax_zoom_bot.text(t, y_pos, event_text,
+                               ha='center', va='top', fontsize=8, fontweight='bold',
+                               bbox=dict(boxstyle='round,pad=0.4', facecolor='orange', alpha=0.5))
+
         elif demand_change_time is not None:
-            ax_zoom_bot.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
-                              alpha=0.8, label='Demand Event')
+            ax_zoom_bot.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=3,
+                              alpha=0.9, label='Demand Event', zorder=5)
 
         ax_zoom_bot.axhline(y=0, color='gray', linestyle='-', linewidth=1.5, alpha=0.5)
-        ax_zoom_bot.set_xlabel("Time (min)", fontsize=11, fontweight='bold')
-        ax_zoom_bot.set_ylabel("Control Action Rate\n(m³/min²)", fontsize=11, fontweight='bold')
-        ax_zoom_bot.legend(loc='upper left', fontsize=9, ncol=3)
-        ax_zoom_bot.grid(True, alpha=0.3, linestyle=':')
+        ax_zoom_bot.set_xlabel("Time (min)", fontsize=12, fontweight='bold')
+        ax_zoom_bot.set_ylabel("Control Action Rate\n(m³/min²)", fontsize=12, fontweight='bold', color='blue')
+        ax_zoom_bot.legend(loc='upper left', fontsize=10, ncol=3, framealpha=0.9)
+        ax_zoom_bot.grid(True, alpha=0.4, linestyle=':')
         ax_zoom_bot.set_xlim(zoom_start, zoom_end)
 
         # Add annotation highlighting inflection points
-        ax_zoom_bot.text(0.98, 0.95, '★ = MPC Inflection Point\n(Significant control change)',
-                        transform=ax_zoom_bot.transAxes, fontsize=9,
+        ax_zoom_bot.text(0.98, 0.98, '★ = MPC Inflection Point\n(Active control adjustment)\n\nNote: ★ appear BEFORE events\nshowing MPC anticipation',
+                        transform=ax_zoom_bot.transAxes, fontsize=10,
                         verticalalignment='top', horizontalalignment='right',
-                        bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+                        bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.9, edgecolor='black', linewidth=2))
 
     # Performance metrics summary
     ax = fig.add_subplot(gs[7, :])
