@@ -418,21 +418,21 @@ def calculate_performance_metrics(df, canal):
 
 
 def visualize_results(df, metrics, scenario, output_dir):
-    """Visualize MPC simulation results (Improved: separate pools, fixed axes, show MPC feedforward control)"""
-    # configure_chinese_font()  # Not needed for English labels
+    """Visualize MPC simulation results (Improved: show MPC predictive control with event markers and zoom-in)"""
 
-    fig = plt.figure(figsize=(20, 16))
-    gs = fig.add_gridspec(5, 2, hspace=0.35, wspace=0.25)
+    fig = plt.figure(figsize=(20, 20))  # Increased height for 6 rows
+    gs = fig.add_gridspec(6, 2, hspace=0.35, wspace=0.25)
 
     scenario_desc = scenario.get("description", "Unknown")
     fig.suptitle(f"Canal MPC Control Simulation Results - {scenario_desc}", fontsize=16, fontweight="bold")
 
     pool_targets = [2.0, 1.8, 1.6, 1.5]
 
-    # 预先计算固定的y轴范围（基于全部数据）
-    all_depths = []
-    for i in range(1, 5):
-        all_depths.extend(df[f"pool{i}_depth"].values)
+    # Detect demand change event (for step change scenario)
+    demand_change_time = None
+    if "demand_change" in scenario.get("description", "").lower() or "step change" in scenario.get("description", "").lower():
+        # Find when demand changes (approximately at 60 min)
+        demand_change_time = 60
 
     # 子图1-4：每个池段单独显示（左侧4个子图）
     for i in range(1, 5):
@@ -447,6 +447,11 @@ def visualize_results(df, metrics, scenario, output_dir):
         # Target depth line
         ax.axhline(y=target, linestyle="--", color="red",
                   alpha=0.7, linewidth=2, label="Target Depth")
+
+        # Add demand change event marker
+        if demand_change_time is not None:
+            ax.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
+                      alpha=0.8, label='Demand Change Event')
 
         # Fixed y-axis range: target ±15cm
         y_margin = 0.15  # 15cm margin
@@ -464,6 +469,11 @@ def visualize_results(df, metrics, scenario, output_dir):
     for i in range(5):
         ax.plot(df["time"], df[f"gate{i}_flow"], label=f"Gate {i}", linewidth=2, alpha=0.8)
 
+    # Add demand change event marker
+    if demand_change_time is not None:
+        ax.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
+                  alpha=0.8, label='Demand Change')
+
     # Fixed y-axis range
     ax.set_ylim(0, 45)
     ax.set_xlabel("Time (min)", fontsize=10)
@@ -477,6 +487,11 @@ def visualize_results(df, metrics, scenario, output_dir):
     for i in range(1, 4):
         ax.plot(df["time"], df[f"offtake{i}"], label=f"Offtake {i}",
                linewidth=2.5, marker='o', markersize=4, alpha=0.8)
+
+    # Add demand change event marker
+    if demand_change_time is not None:
+        ax.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
+                  alpha=0.8, label='Event')
 
     # Fixed y-axis range
     ax.set_ylim(0, 8)
@@ -521,8 +536,70 @@ def visualize_results(df, metrics, scenario, output_dir):
     ax.legend(loc="best", fontsize=8, ncol=3)
     ax.grid(True, alpha=0.3)
 
+    # === NEW: Zoomed-in view of key time window (50-80 min) ===
+    if demand_change_time is not None:
+        ax_zoom = fig.add_subplot(gs[4, :])
+
+        # Filter data for zoom window
+        zoom_start, zoom_end = 45, 90
+        mask = (df["time"] >= zoom_start) & (df["time"] <= zoom_end)
+        df_zoom = df[mask]
+
+        # Create twin axes for different scales
+        ax_zoom_flow = ax_zoom
+        ax_zoom_depth = ax_zoom.twinx()
+
+        # Plot offtake demand (step change) - LEFT Y-AXIS
+        ax_zoom_flow.plot(df_zoom["time"], df_zoom["offtake1"],
+                         color='red', linestyle='--', linewidth=3, marker='s', markersize=5,
+                         label='Offtake 1 (Demand)', alpha=0.8)
+        ax_zoom_flow.plot(df_zoom["time"], df_zoom["offtake2"],
+                         color='darkred', linestyle='--', linewidth=3, marker='s', markersize=5,
+                         label='Offtake 2 (Demand)', alpha=0.8)
+
+        # Plot gate response (MPC action) - LEFT Y-AXIS
+        ax_zoom_flow.plot(df_zoom["time"], df_zoom["gate0_flow"],
+                         color='green', linewidth=2.5, marker='o', markersize=4,
+                         label='Gate 0 (MPC Action)', alpha=0.9)
+        ax_zoom_flow.plot(df_zoom["time"], df_zoom["gate1_flow"],
+                         color='blue', linewidth=2.5, marker='o', markersize=4,
+                         label='Gate 1 (MPC Action)', alpha=0.9)
+
+        # Plot water depth response - RIGHT Y-AXIS
+        ax_zoom_depth.plot(df_zoom["time"], df_zoom["pool1_depth"],
+                          color='purple', linewidth=2.5, linestyle='-', marker='^', markersize=4,
+                          label='Pool 1 Depth (Response)', alpha=0.8)
+
+        # Event marker
+        ax_zoom_flow.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=3,
+                            alpha=0.9, label='Demand Change Event')
+
+        # Annotations
+        ax_zoom_flow.annotate('MPC anticipates\nand acts early',
+                             xy=(demand_change_time-5, 20),
+                             xytext=(demand_change_time-20, 25),
+                             arrowprops=dict(arrowstyle='->', color='green', lw=2),
+                             fontsize=10, color='green', fontweight='bold',
+                             bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
+
+        # Labels and formatting
+        ax_zoom_flow.set_xlabel("Time (min)", fontsize=11, fontweight='bold')
+        ax_zoom_flow.set_ylabel("Flow Rate (m³/min)", fontsize=11, color='black')
+        ax_zoom_depth.set_ylabel("Water Depth (m)", fontsize=11, color='purple')
+        ax_zoom_flow.set_title("Zoomed View: MPC Predictive Control in Action (45-90 min)",
+                              fontsize=12, fontweight="bold")
+
+        # Legends
+        lines1, labels1 = ax_zoom_flow.get_legend_handles_labels()
+        lines2, labels2 = ax_zoom_depth.get_legend_handles_labels()
+        ax_zoom_flow.legend(lines1 + lines2, labels1 + labels2,
+                           loc='upper left', fontsize=9, ncol=2)
+
+        ax_zoom_flow.grid(True, alpha=0.3, linestyle=':')
+        ax_zoom_flow.set_xlim(zoom_start, zoom_end)
+
     # Performance metrics summary
-    ax = fig.add_subplot(gs[4, :])
+    ax = fig.add_subplot(gs[5, :])
     ax.axis("off")
 
     # Create performance metrics table
@@ -563,13 +640,11 @@ def visualize_results(df, metrics, scenario, output_dir):
 
 def create_mpc_animation(df, scenario, output_dir, canal):
     """
-    Create MPC rolling optimization animation (GIF)
+    Create MPC rolling optimization animation (GIF) - Improved layout
 
-    Display content:
-    1. Real-time water depth changes in each pool
-    2. Gate control actions
-    3. Offtake disturbances
-    4. MPC prediction horizon rolling effect
+    Layout: 4 rows x 2 columns (one row per pool)
+    - Left column: Water depth with zoomed y-axis (target ± 0.15m)
+    - Right column: Flow rates (inflow, outflow, offtake demand)
 
     Args:
         df: Simulation result data
@@ -577,342 +652,143 @@ def create_mpc_animation(df, scenario, output_dir, canal):
         output_dir: Output directory
         canal: Canal system object
     """
-    # configure_chinese_font()  # Not needed for English labels
-
     scenario_desc = scenario.get("description", "Unknown")
-    print(f"\nGenerating MPC rolling optimization animation - {scenario_desc}...")
+    print(f"\nGenerating improved MPC animation - {scenario_desc}...")
 
-    # 设置参数
-    prediction_horizon = 12  # 预测时域（步）
-    dt = 5  # 时间步长（分钟）
+    # Parameters
+    prediction_horizon = 12  # Prediction horizon (steps)
+    dt = 15  # Time step from actual simulation (minutes)
 
-    # 提取数据
+    # Extract data
     times = df["time"].values
-    pool_targets = [2.0, 1.8, 1.6, 1.5]  # 各池段目标水深
+    pool_targets = [2.0, 1.8, 1.6, 1.5]  # Target depths for each pool
 
-    # 创建图形
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.25)
+    # Create figure with 4 rows x 2 columns layout
+    fig = plt.figure(figsize=(18, 16))
+    gs = fig.add_gridspec(4, 2, hspace=0.3, wspace=0.25)
 
-    # 子图1: 水深变化（左上，跨2列）
-    ax_depth = fig.add_subplot(gs[0, :])
+    # Create subplots: 4 rows (one per pool), 2 columns (depth, flow)
+    axes_depth = []  # Left column: depth plots
+    axes_flow = []   # Right column: flow plots
 
-    # 子图2: 闸门流量（左中）
-    ax_gates = fig.add_subplot(gs[1, 0])
+    for i in range(4):
+        ax_d = fig.add_subplot(gs[i, 0])  # Depth subplot
+        ax_f = fig.add_subplot(gs[i, 1])  # Flow subplot
+        axes_depth.append(ax_d)
+        axes_flow.append(ax_f)
 
-    # 子图3: 取水需求（右中）
-    ax_offtakes = fig.add_subplot(gs[1, 1])
-
-    # 子图4: 水深偏差（左下）
-    ax_deviation = fig.add_subplot(gs[2, 0])
-
-    # 子图5: 控制动作（右下）
-    ax_control = fig.add_subplot(gs[2, 1])
-
-    # 子图6: 信息面板（底部，跨2列）
-    ax_info = fig.add_subplot(gs[3, :])
-    ax_info.axis("off")
-
-    # 初始化绘图元素
-    depth_lines = []
-    target_lines = []
-    gate_lines = []
-    offtake_lines = []
-    deviation_lines = []
-    control_lines = []
-
-    # 当前时刻标记线
-    current_time_marker_depth = None
-    current_time_marker_gates = None
-    current_time_marker_offtakes = None
-
-    # 预测时域阴影
-    prediction_shade = None
-
-    # Initialization function
-    def init():
-        # Water depth subplot
-        ax_depth.clear()
-        ax_depth.set_xlim(0, times[-1])
-        ax_depth.set_ylim(0.5, 2.5)
-        ax_depth.set_xlabel("Time (min)", fontsize=11)
-        ax_depth.set_ylabel("Water Depth (m)", fontsize=11)
-        ax_depth.set_title("Pool Depth Changes (Real-time + Prediction)", fontsize=12, fontweight="bold")
-        ax_depth.grid(True, alpha=0.3)
-
-        # Gate flow subplot
-        ax_gates.clear()
-        ax_gates.set_xlim(0, times[-1])
-        ax_gates.set_ylim(0, 45)
-        ax_gates.set_xlabel("Time (min)", fontsize=10)
-        ax_gates.set_ylabel("Flow Rate (m³/min)", fontsize=10)
-        ax_gates.set_title("Gate Control Flow", fontsize=11, fontweight="bold")
-        ax_gates.grid(True, alpha=0.3)
-
-        # Offtake demand subplot
-        ax_offtakes.clear()
-        ax_offtakes.set_xlim(0, times[-1])
-        ax_offtakes.set_ylim(0, 8)
-        ax_offtakes.set_xlabel("Time (min)", fontsize=10)
-        ax_offtakes.set_ylabel("Offtake Demand (m³/min)", fontsize=10)
-        ax_offtakes.set_title("Offtake Disturbance", fontsize=11, fontweight="bold")
-        ax_offtakes.grid(True, alpha=0.3)
-
-        # Depth deviation subplot
-        ax_deviation.clear()
-        ax_deviation.set_xlim(0, times[-1])
-        ax_deviation.set_ylim(-0.3, 0.3)
-        ax_deviation.set_xlabel("Time (min)", fontsize=10)
-        ax_deviation.set_ylabel("Depth Deviation (m)", fontsize=10)
-        ax_deviation.set_title("Depth Deviation (Actual - Target)", fontsize=11, fontweight="bold")
-        ax_deviation.axhline(y=0, color="black", linestyle="--", alpha=0.5)
-        ax_deviation.grid(True, alpha=0.3)
-
-        # Control action subplot
-        ax_control.clear()
-        ax_control.set_xlim(0, times[-1])
-        ax_control.set_ylim(0, 5)
-        ax_control.set_xlabel("Time (min)", fontsize=10)
-        ax_control.set_ylabel("Flow Change (m³/min)", fontsize=10)
-        ax_control.set_title("Gate Adjustment Magnitude", fontsize=11, fontweight="bold")
-        ax_control.grid(True, alpha=0.3)
-
-        return []
-
-    # 更新函数（每一帧）
+    # Update function (called for each frame)
     def update(frame):
-        nonlocal current_time_marker_depth, current_time_marker_gates
-        nonlocal current_time_marker_offtakes, prediction_shade
-
-        # 当前时刻
         current_idx = frame
         current_time = times[current_idx]
 
-        # 清除旧的图形元素
-        ax_depth.clear()
-        ax_gates.clear()
-        ax_offtakes.clear()
-        ax_deviation.clear()
-        ax_control.clear()
-        ax_info.clear()
-        ax_info.axis("off")
+        # Clear all subplots
+        for ax in axes_depth + axes_flow:
+            ax.clear()
 
-        # === 子图1: 水深变化 ===
-        ax_depth.set_xlim(0, times[-1])
-
-        # 固定y轴范围（基于全部数据的范围）
-        all_depths_global = []
-        for i in range(1, 5):
-            all_depths_global.extend(df[f"pool{i}_depth"].values)
-        y_min = min(all_depths_global) - 0.05
-        y_max = max(all_depths_global) + 0.05
-        ax_depth.set_ylim(y_min, y_max)
-
-        ax_depth.set_xlabel("Time (min)", fontsize=11)
-        ax_depth.set_ylabel("Water Depth (m)", fontsize=11)
-        ax_depth.set_title("Pool Depth Changes (Real-time + MPC Prediction Horizon)", fontsize=12, fontweight="bold")
-        ax_depth.grid(True, alpha=0.3)
-
-        # Plot historical depth (occurred)
+        # Colors for each pool
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
-        for i in range(1, 5):
-            # Historical trajectory (solid line)
-            ax_depth.plot(
+
+        # Plot each pool (4 rows)
+        for i in range(4):
+            pool_idx = i + 1
+            target = pool_targets[i]
+
+            # === Left subplot: Water depth (zoomed in) ===
+            ax_d = axes_depth[i]
+
+            # Plot depth curve
+            ax_d.plot(
                 times[:current_idx+1],
-                df[f"pool{i}_depth"][:current_idx+1],
-                color=colors[i-1],
-                linewidth=2.5,
-                label=f"Pool {i}",
+                df[f"pool{pool_idx}_depth"][:current_idx+1],
+                color=colors[i],
+                linewidth=3,
+                label=f"Actual Depth",
                 alpha=0.9
             )
 
-            # Target depth (dashed line)
-            ax_depth.axhline(
-                y=pool_targets[i-1],
-                color=colors[i-1],
-                linestyle="--",
-                alpha=0.4,
-                linewidth=1.5
-            )
+            # Target line
+            ax_d.axhline(y=target, color='red', linestyle='--', linewidth=2, alpha=0.7, label="Target")
 
-        # Prediction horizon visualization (shaded area)
-        prediction_end = min(current_time + prediction_horizon * dt, times[-1])
-        ax_depth.axvspan(
-            current_time,
-            prediction_end,
-            alpha=0.15,
-            color="yellow",
-            label="MPC Prediction Horizon"
-        )
+            # Current time marker
+            ax_d.axvline(x=current_time, color='green', linestyle='-', linewidth=2, alpha=0.5)
 
-        # Current time marker
-        ax_depth.axvline(
-            x=current_time,
-            color="red",
-            linestyle="-",
-            linewidth=2.5,
-            alpha=0.7,
-            label="Current Time"
-        )
+            # Set zoomed y-axis: target ± 0.15m
+            ax_d.set_ylim(target - 0.15, target + 0.15)
+            ax_d.set_xlim(0, times[-1])
+            ax_d.set_ylabel("Depth (m)", fontsize=10)
+            ax_d.set_title(f"Pool {pool_idx} - Depth (Target: {target}m)", fontsize=11, fontweight='bold')
+            ax_d.grid(True, alpha=0.3)
+            ax_d.legend(loc='upper right', fontsize=8)
 
-        ax_depth.legend(loc="upper right", fontsize=9, ncol=2)
+            if i == 3:  # Only show x-label on bottom plot
+                ax_d.set_xlabel("Time (min)", fontsize=10)
 
-        # === Subplot 2: Gate flow ===
-        ax_gates.set_xlim(0, times[-1])
-        ax_gates.set_ylim(0, 45)
-        ax_gates.set_xlabel("Time (min)", fontsize=10)
-        ax_gates.set_ylabel("Flow Rate (m³/min)", fontsize=10)
-        ax_gates.set_title("Gate Control Flow", fontsize=11, fontweight="bold")
-        ax_gates.grid(True, alpha=0.3)
+            # === Right subplot: Flow rates ===
+            ax_f = axes_flow[i]
 
-        for i in range(5):
-            ax_gates.plot(
+            # Upstream gate (inflow)
+            ax_f.plot(
                 times[:current_idx+1],
                 df[f"gate{i}_flow"][:current_idx+1],
-                linewidth=2,
-                label=f"Gate {i}",
-                alpha=0.8
-            )
-
-        ax_gates.axvline(x=current_time, color="red", linestyle="-", linewidth=2, alpha=0.5)
-        ax_gates.legend(loc="best", fontsize=8, ncol=3)
-
-        # === Subplot 3: Offtake demand ===
-        ax_offtakes.set_xlim(0, times[-1])
-        ax_offtakes.set_ylim(0, 8)
-        ax_offtakes.set_xlabel("Time (min)", fontsize=10)
-        ax_offtakes.set_ylabel("Offtake Demand (m³/min)", fontsize=10)
-        ax_offtakes.set_title("Offtake Disturbance (External Demand)", fontsize=11, fontweight="bold")
-        ax_offtakes.grid(True, alpha=0.3)
-
-        for i in range(1, 4):
-            ax_offtakes.plot(
-                times[:current_idx+1],
-                df[f"offtake{i}"][:current_idx+1],
+                color='green',
                 linewidth=2.5,
-                marker='o',
-                markersize=3,
-                label=f"Offtake {i}",
+                label=f"Gate {i} (Inflow)",
                 alpha=0.8
             )
 
-        ax_offtakes.axvline(x=current_time, color="red", linestyle="-", linewidth=2, alpha=0.5)
-        ax_offtakes.legend(loc="best", fontsize=9)
-
-        # === Subplot 4: Depth deviation (converted to cm) ===
-        ax_deviation.set_xlim(0, times[-1])
-
-        for i in range(1, 5):
-            deviation = (df[f"pool{i}_depth"][:current_idx+1] - pool_targets[i-1]) * 100  # Convert to cm
-            ax_deviation.plot(
+            # Downstream gate (outflow)
+            ax_f.plot(
                 times[:current_idx+1],
-                deviation,
-                linewidth=2,
-                label=f"Pool {i}",
+                df[f"gate{i+1}_flow"][:current_idx+1],
+                color='blue',
+                linewidth=2.5,
+                label=f"Gate {i+1} (Outflow)",
                 alpha=0.8
             )
 
-        # Fixed y-axis range: ±15cm
-        ax_deviation.set_ylim(-15, 15)
-
-        ax_deviation.set_xlabel("Time (min)", fontsize=10)
-        ax_deviation.set_ylabel("Depth Deviation (cm)", fontsize=10)
-        ax_deviation.set_title("Depth Deviation (Actual - Target)", fontsize=11, fontweight="bold")
-        ax_deviation.axhline(y=0, color="black", linestyle="--", alpha=0.6, linewidth=1.5)
-        ax_deviation.grid(True, alpha=0.3)
-
-        ax_deviation.axvline(x=current_time, color="red", linestyle="-", linewidth=2, alpha=0.5)
-        ax_deviation.legend(loc="best", fontsize=8, ncol=2)
-
-        # === Subplot 5: Control action magnitude ===
-        ax_control.set_xlim(0, times[-1])
-        ax_control.set_ylim(0, 5)
-        ax_control.set_xlabel("Time (min)", fontsize=10)
-        ax_control.set_ylabel("Flow Change (m³/min)", fontsize=10)
-        ax_control.set_title("Gate Adjustment Magnitude (Control Smoothness)", fontsize=11, fontweight="bold")
-        ax_control.grid(True, alpha=0.3)
-
-        for i in range(5):
-            if current_idx > 0:
-                flow_changes = np.abs(np.diff(df[f"gate{i}_flow"][:current_idx+1]))
-                ax_control.plot(
-                    times[1:current_idx+1],
-                    flow_changes,
-                    linewidth=1.5,
-                    label=f"Gate {i}",
-                    alpha=0.7
+            # Offtake demand (if exists)
+            if pool_idx in [1, 2, 3]:
+                ax_f.plot(
+                    times[:current_idx+1],
+                    df[f"offtake{pool_idx}"][:current_idx+1],
+                    color='red',
+                    linestyle='--',
+                    linewidth=2,
+                    label=f"Offtake {pool_idx}",
+                    alpha=0.8
                 )
 
-        ax_control.axvline(x=current_time, color="red", linestyle="-", linewidth=2, alpha=0.5)
-        if current_idx > 0:
-            ax_control.legend(loc="best", fontsize=8, ncol=3)
+            # Current time marker
+            ax_f.axvline(x=current_time, color='green', linestyle='-', linewidth=2, alpha=0.5)
 
-        # === Subplot 6: Information panel ===
-        # Calculate current performance metrics
-        current_depths = [df[f"pool{i}_depth"].iloc[current_idx] for i in range(1, 5)]
-        current_gates = [df[f"gate{i}_flow"].iloc[current_idx] for i in range(5)]
-        current_offtakes = [df[f"offtake{i}"].iloc[current_idx] for i in range(1, 4)]
+            # Auto-scale y-axis to show variation clearly
+            ax_f.set_xlim(0, times[-1])
+            ax_f.set_ylabel("Flow (m³/min)", fontsize=10)
+            ax_f.set_title(f"Pool {pool_idx} - Flow Rates", fontsize=11, fontweight='bold')
+            ax_f.grid(True, alpha=0.3)
+            ax_f.legend(loc='upper right', fontsize=8)
 
-        # Calculate depth deviation
-        deviations = [current_depths[i] - pool_targets[i] for i in range(4)]
-        max_deviation = max(abs(d) for d in deviations)
-
-        # Fault detection
-        fault_status = ""
-        if "gate_failure" in scenario:
-            gf = scenario["gate_failure"]
-            if gf["start_time"] <= frame < gf["start_time"] + gf["duration"]:
-                fault_status = f"WARNING: Gate {gf['gate_id']} Flow Constrained ({gf['max_flow_reduction']*100:.0f}%)"
-
-        info_text = f"""
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  MPC Rolling Optimization Control - Real-time Simulation              Time: {current_time:.0f}/{times[-1]:.0f} min  │
-├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                                          │
-│  Current State:                                                                                          │
-│    Depth: Pool1={current_depths[0]:.3f}m  Pool2={current_depths[1]:.3f}m  Pool3={current_depths[2]:.3f}m  Pool4={current_depths[3]:.3f}m    │
-│    Deviation: Δ1={deviations[0]:+.3f}m  Δ2={deviations[1]:+.3f}m  Δ3={deviations[2]:+.3f}m  Δ4={deviations[3]:+.3f}m  Max: {max_deviation:.3f}m  │
-│                                                                                                          │
-│  Control Action:                                                                                         │
-│    Gates: G0={current_gates[0]:.1f}  G1={current_gates[1]:.1f}  G2={current_gates[2]:.1f}  G3={current_gates[3]:.1f}  G4={current_gates[4]:.1f} m³/min     │
-│                                                                                                          │
-│  Disturbance:                                                                                            │
-│    Offtake: O1={current_offtakes[0]:.1f}  O2={current_offtakes[1]:.1f}  O3={current_offtakes[2]:.1f} m³/min                       │
-│    {fault_status:<100} │
-│                                                                                                          │
-│  MPC Params: Prediction={prediction_horizon}steps({prediction_horizon*dt}min)  Control=6steps(30min)  Sample={dt}min    │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-        """
-
-        ax_info.text(
-            0.5, 0.5,
-            info_text,
-            transform=ax_info.transAxes,
-            fontsize=9,
-            verticalalignment="center",
-            horizontalalignment="center",
-            family="monospace",
-            bbox=dict(boxstyle="round", facecolor="lightblue", alpha=0.3)
-        )
+            if i == 3:  # Only show x-label on bottom plot
+                ax_f.set_xlabel("Time (min)", fontsize=10)
 
         # Main title
         fig.suptitle(
-            f"Canal MPC Rolling Optimization Control Animation - {scenario_desc}",
+            f"MPC Control Animation - {scenario_desc} (Time: {current_time:.0f}/{times[-1]:.0f} min)",
             fontsize=14,
             fontweight="bold"
         )
 
         return []
 
-    # 创建动画（降低采样率，减慢速度）
-    frames = range(0, len(times), 2)  # 每隔2个时间步采样（降低采样率）
+    # Create animation (sample every frame for smoother playback)
+    frames = range(0, len(times), 1)  # Use all frames
 
     anim = FuncAnimation(
         fig,
         update,
-        init_func=init,
         frames=frames,
-        interval=500,  # 每帧间隔500ms（从200ms增加到500ms，减慢速度）
+        interval=800,  # 800ms per frame (slower for better observation)
         blit=False,
         repeat=True
     )
