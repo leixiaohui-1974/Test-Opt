@@ -828,11 +828,11 @@ def create_mpc_animation(df, scenario, output_dir, canal):
             if i == 3:  # Only show x-label on bottom plot
                 ax_d.set_xlabel("Time (min)", fontsize=10)
 
-            # === Right subplot: Flow rates ===
+            # === Right subplot: Flow rates (with dual y-axis) ===
             ax_f = axes_flow[i]
 
             # Upstream gate (inflow)
-            ax_f.plot(
+            line1 = ax_f.plot(
                 times[:current_idx+1],
                 df[f"gate{i}_flow"][:current_idx+1],
                 color='green',
@@ -842,7 +842,7 @@ def create_mpc_animation(df, scenario, output_dir, canal):
             )
 
             # Downstream gate (outflow)
-            ax_f.plot(
+            line2 = ax_f.plot(
                 times[:current_idx+1],
                 df[f"gate{i+1}_flow"][:current_idx+1],
                 color='blue',
@@ -851,28 +851,51 @@ def create_mpc_animation(df, scenario, output_dir, canal):
                 alpha=0.8
             )
 
-            # Offtake demand (if exists)
+            # Create right y-axis for offtake demand (if exists)
             if pool_idx in [1, 2, 3]:
-                ax_f.plot(
+                ax_f_right = ax_f.twinx()
+
+                line3 = ax_f_right.plot(
                     times[:current_idx+1],
                     df[f"offtake{pool_idx}"][:current_idx+1],
                     color='red',
                     linestyle='--',
-                    linewidth=2,
+                    linewidth=2.5,
+                    marker='o',
+                    markersize=3,
                     label=f"Offtake {pool_idx}",
                     alpha=0.8
                 )
 
-            # Current time marker
-            ax_f.axvline(x=current_time, color='green', linestyle='-', linewidth=2, alpha=0.5)
+                # Set right y-axis range for offtake
+                offtake_data = df[f"offtake{pool_idx}"][:current_idx+1].values
+                if len(offtake_data) > 0:
+                    offtake_min = offtake_data.min()
+                    offtake_max = offtake_data.max()
+                    offtake_range = offtake_max - offtake_min
+                    offtake_margin = max(0.5, offtake_range * 0.15)
+                    ax_f_right.set_ylim(offtake_min - offtake_margin, offtake_max + offtake_margin)
 
-            # Set dynamic y-axis range to emphasize variations
+                ax_f_right.set_ylabel("Offtake (m³/min)", fontsize=10, color='red')
+                ax_f_right.tick_params(axis='y', labelcolor='red')
+
+                # Combine legends from both axes
+                lines = line1 + line2 + line3
+                labels = [l.get_label() for l in lines]
+                ax_f.legend(lines, labels, loc='upper right', fontsize=8)
+            else:
+                # No offtake, only show gate flows
+                ax_f.legend(loc='upper right', fontsize=8)
+
+            # Current time marker
+            ax_f.axvline(x=current_time, color='gray', linestyle='-', linewidth=2, alpha=0.4)
+
+            # Set dynamic y-axis range to emphasize variations (left axis for gate flows)
             ax_f.set_ylim(flow_ranges[i][0], flow_ranges[i][1])
             ax_f.set_xlim(0, times[-1])
-            ax_f.set_ylabel("Flow (m³/min)", fontsize=10)
-            ax_f.set_title(f"Pool {pool_idx} - Flow Rates", fontsize=11, fontweight='bold')
+            ax_f.set_ylabel("Gate Flow (m³/min)", fontsize=10)
+            ax_f.set_title(f"Pool {pool_idx} - Flow Rates & Offtake", fontsize=11, fontweight='bold')
             ax_f.grid(True, alpha=0.3)
-            ax_f.legend(loc='upper right', fontsize=8)
 
             if i == 3:  # Only show x-label on bottom plot
                 ax_f.set_xlabel("Time (min)", fontsize=10)
