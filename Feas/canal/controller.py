@@ -3,6 +3,7 @@
 """
 
 import numpy as np
+import cvxpy as cp
 
 
 class CanalMPCController:
@@ -162,3 +163,144 @@ class CanalMPCController:
             self.middle_gate_gain = middle_gate_gain
         if last_gate_gain is not None:
             self.last_gate_gain = last_gate_gain
+
+    def optimize_with_mass_balance(self, current_depths, offtake_forecast, current_gate_flows=None):
+        """
+        基于优化求解的MPC，带质量平衡约束
+
+        质量平衡约束: Gate[i+1] + Offtake[i] = Gate[i]
+        这将产生级联流量递减效果
+
+        Args:
+            current_depths: 当前水深 [pool1, pool2, pool3, pool4]
+            offtake_forecast: 未来取水预测 [time][pool_id]
+            current_gate_flows: 当前闸门流量 [gate0, gate1, gate2, gate3, gate4] (可选)
+
+        Returns:
+            optimal_gate_flows: 最优闸门流量 [gate0, gate1, gate2, gate3, gate4]
+        """
+        n_pools = len(self.system.pools)
+        n_gates = len(self.system.gates)
+        N = self.prediction_horizon
+
+        # 如果没有提供当前闸门流量，使用默认值
+        if current_gate_flows is None:
+            current_gate_flows = [self.system.gates[i].max_flow * 0.6 for i in range(n_gates)]
+
+        # 定义优化变量
+        gate_flows = cp.Variable((N, n_gates))  # 闸门流量决策变量
+        depths = cp.Variable((N+1, n_pools))     # 水深状态变量
+
+        # 目标函数
+        cost = 0
+
+        # 深度跟踪误差成本
+        for t in range(N):
+            for i in range(n_pools):
+                target = self.system.pools[i].target_depth
+                cost += self.depth_weight * cp.square(depths[t+1, i] - target)
+
+        # 终端成本
+        for i in range(n_pools):
+            target = self.system.pools[i].target_depth
+            cost += self.terminal_weight * cp.square(depths[N, i] - target)
+
+        # 控制平滑成本
+        for t in range(N-1):
+            for i in range(n_gates):
+                cost += self.control_weight * cp.square(gate_flows[t+1, i] - gate_flows[t, i])
+
+        # 约束条件
+        constraints = []
+
+        # 初始状态约束
+        for i in range(n_pools):
+            constraints.append(depths[0, i] == current_depths[i])
+
+        # 动态约束 (简化的IDZ模型)
+        for t in range(N):
+            # 获取offtake预测
+            if t < len(offtake_forecast):
+                offtakes = offtake_forecast[t]
+            else:
+                offtakes = offtake_forecast[-1] if offtake_forecast else [0] * (n_pools - 1)
+
+            # 为每个池段建立动态方程
+            for i in range(n_pools):
+                # 流入 = gate[i]
+                # 流出 = gate[i+1] + offtake[i] (如果有offtake的话)
+                inflow = gate_flows[t, i]
+
+                if i < n_pools - 1:
+                    outflow = gate_flows[t, i+1]
+                    if i < len(offtakes):
+                        outflow += offtakes[i]
+                else:
+                    # 最后一个池段
+                    outflow = gate_flows[t, i+1]
+
+                # 简化的水深变化模型: dh/dt ≈ (inflow - outflow) / area
+                area = self.system.pools[i].length * self.system.pools[i].width
+                depth_change = (inflow - outflow) * self.dt / area
+
+                constraints.append(depths[t+1, i] == depths[t, i] + depth_change)
+
+        # 质量平衡约束 (核心约束!)
+        # Gate[i+1] + Offtake[i] = Gate[i] (or Gate[i+1] <= Gate[i] - Offtake[i])
+        # 这将确保流量从上游到下游递减
+        # 使用软约束（放宽容差）以提高可行性
+        mass_balance_penalty = 0
+        for t in range(N):
+            if t < len(offtake_forecast):
+                offtakes = offtake_forecast[t]
+            else:
+                offtakes = offtake_forecast[-1] if offtake_forecast else [0] * (n_pools - 1)
+
+            # 对每个池段应用质量平衡
+            for i in range(n_gates - 1):
+                if i < len(offtakes):
+                    # 有offtake的池段: Gate[i+1] = Gate[i] - Offtake[i]
+                    expected_downstream = gate_flows[t, i] - offtakes[i]
+                else:
+                    # 没有offtake的池段（如Pool 4）: Gate[i+1] ≈ Gate[i]
+                    expected_downstream = gate_flows[t, i]
+
+                # 松弛变量方法：允许偏差，但在目标函数中惩罚
+                mass_balance_penalty += 10.0 * cp.square(gate_flows[t, i+1] - expected_downstream)
+
+                # 硬约束：确保物理可行性（下游流量不能凭空增加）
+                if i < len(offtakes):
+                    # 有offtake: 下游必须小于等于上游（因为有分水）
+                    constraints.append(gate_flows[t, i+1] <= gate_flows[t, i])
+                else:
+                    # 没有offtake: 下游应该约等于上游（允许小幅调节）
+                    constraints.append(gate_flows[t, i+1] <= gate_flows[t, i] + 1.0)
+                    constraints.append(gate_flows[t, i+1] >= gate_flows[t, i] - 1.0)
+
+        # 将质量平衡惩罚加入目标函数
+        cost += mass_balance_penalty
+
+        # 闸门流量上下限约束
+        for t in range(N):
+            for i in range(n_gates):
+                constraints.append(gate_flows[t, i] >= self.system.gates[i].min_flow)
+                constraints.append(gate_flows[t, i] <= self.system.gates[i].max_flow)
+
+        # 求解优化问题
+        problem = cp.Problem(cp.Minimize(cost), constraints)
+
+        try:
+            problem.solve(solver=cp.OSQP, verbose=False)
+
+            if problem.status in ['optimal', 'optimal_inaccurate']:
+                # 返回第一个时间步的最优控制动作
+                return gate_flows[0, :].value.tolist()
+            else:
+                print(f"Warning: MPC optimization failed with status: {problem.status}")
+                # 返回启发式解作为后备
+                return self.optimize(current_depths, offtake_forecast)
+
+        except Exception as e:
+            print(f"Warning: MPC optimization error: {e}")
+            # 返回启发式解作为后备
+            return self.optimize(current_depths, offtake_forecast)

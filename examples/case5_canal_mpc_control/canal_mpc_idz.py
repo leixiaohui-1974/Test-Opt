@@ -177,6 +177,15 @@ def create_demand_scenario(scenario_type="normal", dt=10):
             "pool2": [3.0] * steps_before + [1.0] * (steps_during + steps_after),
             "pool3": [2.5] * timesteps,
         },
+        "cascading_demand": {
+            "description": "Cascading Offtake Demand Increases",
+            # Pool 1: 需求在60min时增加
+            "pool1": [2.0] * int(60/dt) + [6.0] * (timesteps - int(60/dt)),
+            # Pool 2: 需求在75min时增加
+            "pool2": [3.0] * int(75/dt) + [7.0] * (timesteps - int(75/dt)),
+            # Pool 3: 需求在90min时增加
+            "pool3": [2.5] * int(90/dt) + [6.5] * (timesteps - int(90/dt)),
+        },
         "peak_demand": {
             "description": "Peak Demand with Sinusoidal Variation",
             "pool1": [2.0 + 3.0 * np.sin(i * 2 * np.pi / timesteps) for i in range(timesteps)],
@@ -295,9 +304,22 @@ def run_mpc_simulation(scenario_type="normal", dt=15):
         ]
 
         # MPC使用带噪声的测量值
-        offtake_forecast = []  # 简化：使用预测值
+        # 构建offtake预测序列（预测时域内假设需求保持当前预测值）
+        offtake_forecast = []
+        for t in range(mpc.prediction_horizon):
+            # 每个时间步的offtake预测 [offtake1, offtake2, offtake3]
+            offtake_forecast.append([
+                offtakes_predicted[1],
+                offtakes_predicted[2],
+                offtakes_predicted[3]
+            ])
 
-        optimal_flows = mpc.optimize(measured_depths, offtake_forecast)
+        # 使用带质量平衡约束的优化方法
+        optimal_flows = mpc.optimize_with_mass_balance(
+            measured_depths,
+            offtake_forecast,
+            current_gate_flows=previous_gate_flows
+        )
 
         # ====== 扰动3：执行器速率限制（闸门调节速度限制）======
         # 真实闸门每10分钟最多调整5-10%的流量
@@ -430,8 +452,13 @@ def visualize_results(df, metrics, scenario, output_dir):
 
     # Detect demand change event (for step change scenario)
     demand_change_time = None
-    if "demand_change" in scenario.get("description", "").lower() or "step change" in scenario.get("description", "").lower():
-        # Find when demand changes (approximately at 60 min)
+    demand_change_times = []  # For cascading scenarios
+
+    if "cascading" in scenario.get("description", "").lower():
+        # Cascading demand scenario: multiple events at different times
+        demand_change_times = [60, 75, 90]  # Pool 1, 2, 3 demand changes
+    elif "demand_change" in scenario.get("description", "").lower() or "step change" in scenario.get("description", "").lower():
+        # Single demand change event
         demand_change_time = 60
 
     # 子图1-4：每个池段单独显示（左侧4个子图）
@@ -448,8 +475,13 @@ def visualize_results(df, metrics, scenario, output_dir):
         ax.axhline(y=target, linestyle="--", color="red",
                   alpha=0.7, linewidth=2, label="Target Depth")
 
-        # Add demand change event marker
-        if demand_change_time is not None:
+        # Add demand change event marker(s)
+        if demand_change_times:
+            for idx, t in enumerate(demand_change_times):
+                label = f'Pool {idx+1} Demand Change' if idx == 0 else None
+                ax.axvline(x=t, color='orange', linestyle=':', linewidth=2.5,
+                          alpha=0.8, label=label if idx == 0 else '')
+        elif demand_change_time is not None:
             ax.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
                       alpha=0.8, label='Demand Change Event')
 
@@ -473,8 +505,13 @@ def visualize_results(df, metrics, scenario, output_dir):
         all_gate_flows.extend(df[f"gate{i}_flow"].values)
         ax.plot(df["time"], df[f"gate{i}_flow"], label=f"Gate {i}", linewidth=2, alpha=0.8)
 
-    # Add demand change event marker
-    if demand_change_time is not None:
+    # Add demand change event marker(s)
+    if demand_change_times:
+        for idx, t in enumerate(demand_change_times):
+            label = 'Demand Changes' if idx == 0 else ''
+            ax.axvline(x=t, color='orange', linestyle=':', linewidth=2.5,
+                      alpha=0.8, label=label)
+    elif demand_change_time is not None:
         ax.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
                   alpha=0.8, label='Demand Change')
 
@@ -496,8 +533,13 @@ def visualize_results(df, metrics, scenario, output_dir):
         ax.plot(df["time"], df[f"offtake{i}"], label=f"Offtake {i}",
                linewidth=2.5, marker='o', markersize=4, alpha=0.8)
 
-    # Add demand change event marker
-    if demand_change_time is not None:
+    # Add demand change event marker(s)
+    if demand_change_times:
+        for idx, t in enumerate(demand_change_times):
+            label = 'Events' if idx == 0 else ''
+            ax.axvline(x=t, color='orange', linestyle=':', linewidth=2.5,
+                      alpha=0.8, label=label)
+    elif demand_change_time is not None:
         ax.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
                   alpha=0.8, label='Event')
 
@@ -544,12 +586,15 @@ def visualize_results(df, metrics, scenario, output_dir):
     ax.legend(loc="best", fontsize=8, ncol=3)
     ax.grid(True, alpha=0.3)
 
-    # === NEW: Zoomed-in view of key time window (50-80 min) ===
-    if demand_change_time is not None:
+    # === NEW: Zoomed-in view of key time window ===
+    if demand_change_time is not None or demand_change_times:
         ax_zoom = fig.add_subplot(gs[4, :])
 
-        # Filter data for zoom window
-        zoom_start, zoom_end = 45, 90
+        # Filter data for zoom window (wider window for cascading scenario)
+        if demand_change_times:
+            zoom_start, zoom_end = 45, 120  # Wider window to show all cascading events
+        else:
+            zoom_start, zoom_end = 45, 90
         mask = (df["time"] >= zoom_start) & (df["time"] <= zoom_end)
         df_zoom = df[mask]
 
@@ -578,9 +623,15 @@ def visualize_results(df, metrics, scenario, output_dir):
                           color='purple', linewidth=2.5, linestyle='-', marker='^', markersize=4,
                           label='Pool 1 Depth (Response)', alpha=0.8)
 
-        # Event marker
-        ax_zoom_flow.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=3,
-                            alpha=0.9, label='Demand Change Event')
+        # Event marker(s)
+        if demand_change_times:
+            for idx, t in enumerate(demand_change_times):
+                label = 'Demand Change Events' if idx == 0 else ''
+                ax_zoom_flow.axvline(x=t, color='orange', linestyle=':', linewidth=3,
+                                    alpha=0.9, label=label)
+        elif demand_change_time is not None:
+            ax_zoom_flow.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=3,
+                                alpha=0.9, label='Demand Change Event')
 
         # Calculate dynamic y-axis range for flow (only gate flows for tighter range)
         zoom_gate_flows = []
@@ -593,19 +644,29 @@ def visualize_results(df, metrics, scenario, output_dir):
 
         # Annotations with dynamic positioning
         flow_mid = (zoom_flow_min + zoom_flow_max) / 2
-        ax_zoom_flow.annotate('MPC anticipates\nand acts early',
-                             xy=(demand_change_time-5, flow_mid),
-                             xytext=(demand_change_time-20, flow_mid + zoom_flow_margin * 0.5),
-                             arrowprops=dict(arrowstyle='->', color='green', lw=2),
-                             fontsize=10, color='green', fontweight='bold',
-                             bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
+        if demand_change_times:
+            # For cascading scenario, annotate the sequential control effect
+            ax_zoom_flow.annotate('MPC coordinates\nsequential adjustments',
+                                 xy=(75, flow_mid),
+                                 xytext=(100, flow_mid + zoom_flow_margin * 0.5),
+                                 arrowprops=dict(arrowstyle='->', color='green', lw=2),
+                                 fontsize=10, color='green', fontweight='bold',
+                                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
+        elif demand_change_time is not None:
+            ax_zoom_flow.annotate('MPC anticipates\nand acts early',
+                                 xy=(demand_change_time-5, flow_mid),
+                                 xytext=(demand_change_time-20, flow_mid + zoom_flow_margin * 0.5),
+                                 arrowprops=dict(arrowstyle='->', color='green', lw=2),
+                                 fontsize=10, color='green', fontweight='bold',
+                                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
 
         # Labels and formatting
         ax_zoom_flow.set_xlabel("Time (min)", fontsize=11, fontweight='bold')
         ax_zoom_flow.set_ylabel("Flow Rate (m³/min)", fontsize=11, color='black')
         ax_zoom_depth.set_ylabel("Water Depth (m)", fontsize=11, color='purple')
-        ax_zoom_flow.set_title("Zoomed View: MPC Predictive Control in Action (45-90 min)",
-                              fontsize=12, fontweight="bold")
+
+        title_text = f"Zoomed View: MPC Predictive Control in Action ({zoom_start}-{zoom_end} min)"
+        ax_zoom_flow.set_title(title_text, fontsize=12, fontweight="bold")
 
         # Legends
         lines1, labels1 = ax_zoom_flow.get_legend_handles_labels()
@@ -1030,7 +1091,7 @@ def main():
     output_dir.mkdir(exist_ok=True)
 
     # 运行多个场景
-    scenarios = ["demand_change", "gate_failure"]  # 只运行有扰动的场景
+    scenarios = ["cascading_demand"]  # 新设计的级联需求场景
     dt = 15  # 控制步长
 
     for scenario_type in scenarios:
