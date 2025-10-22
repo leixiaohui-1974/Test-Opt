@@ -25,229 +25,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 from datetime import datetime, timedelta
-from collections import deque
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from Feas.visualization import configure_chinese_font
 from Feas.control_evaluation import ControlPerformanceEvaluator, print_performance_report
-
-
-class IDZCanalPool:
-    """IDZ模型的渠道池段（改进版：Muskingum蓄量关系）"""
-
-    def __init__(
-        self,
-        pool_id,
-        length,
-        width,
-        bottom_slope,
-        roughness,
-        target_depth,
-        delay_time,
-        backwater_coeff=0.1,
-        side_slope=1.5,  # 边坡系数（梯形断面）
-    ):
-        """
-        Args:
-            pool_id: 池段编号
-            length: 池段长度 (m)
-            width: 渠底宽度 (m)
-            bottom_slope: 底坡
-            roughness: 糙率 (Manning n)
-            target_depth: 目标水深 (m)
-            delay_time: 延迟时间 (分钟)
-            backwater_coeff: 顶托系数
-            side_slope: 边坡系数 (m=1.5表示1:1.5的边坡)
-        """
-        self.pool_id = pool_id
-        self.length = length
-        self.width = width  # 底宽
-        self.bottom_slope = bottom_slope
-        self.roughness = roughness
-        self.target_depth = target_depth
-        self.delay_time = delay_time
-        self.backwater_coeff = backwater_coeff
-        self.side_slope = side_slope  # 梯形断面边坡
-
-        # Muskingum参数（蓄量=f(流量,水位)）
-        # S = K[X*I + (1-X)*O]，其中K是蓄量常数，X是权重
-        wave_celerity = self._calculate_wave_celerity()
-        self.muskingum_K = (length / (wave_celerity * 60)) * 2.5  # 增大K值2.5倍（增加系统惯性）
-        self.muskingum_X = 0.20  # 稍微降低X值，增加滞后效应
-
-        # 延迟队列（存储历史入流）
-        self.inflow_history = deque(maxlen=int(delay_time) + 1)
-
-        # 当前状态
-        self.current_depth = target_depth
-        self.current_inflow = 20.0  # 初始流量
-        self.current_outflow = 20.0
-        # 初始化时，流量平衡，使用目标水深
-        self.current_storage = self._calculate_muskingum_storage(
-            target_depth, 20.0, 20.0
-        )
-
-    def _calculate_wave_celerity(self):
-        """计算波速 (m/s) - 用于Muskingum K参数"""
-        # 简化：c = dQ/dA ≈ 5/3 * v
-        # 估算平均流速
-        normal_depth = self.target_depth
-        area = self._get_wetted_area(normal_depth)
-        perimeter = self._get_wetted_perimeter(normal_depth)
-        hydraulic_radius = area / perimeter
-
-        # Manning公式估算流速
-        velocity = (1/self.roughness) * (hydraulic_radius ** (2/3)) * (self.bottom_slope ** 0.5)
-        celerity = (5/3) * velocity
-        return max(celerity, 0.5)  # 最小0.5 m/s
-
-    def _get_wetted_area(self, depth):
-        """计算过流断面面积（梯形断面）"""
-        # A = (b + m*h)*h
-        return (self.width + self.side_slope * depth) * depth
-
-    def _get_wetted_perimeter(self, depth):
-        """计算湿周（梯形断面）"""
-        # P = b + 2*h*sqrt(1+m^2)
-        return self.width + 2 * depth * np.sqrt(1 + self.side_slope**2)
-
-    def _flow_to_depth(self, flow):
-        """根据流量计算水深（Manning公式反算）"""
-        # 迭代求解：Q = (1/n) * A * R^(2/3) * S^(1/2)
-        # 简化：使用目标水深附近的线性近似
-        target_flow = self._depth_to_flow(self.target_depth)
-        if abs(target_flow) < 0.1:
-            return self.target_depth
-
-        depth_ratio = (flow / target_flow) ** 0.6  # 简化关系
-        estimated_depth = self.target_depth * depth_ratio
-
-        # 限制在合理范围
-        return np.clip(estimated_depth, self.target_depth * 0.2, self.target_depth * 2.5)
-
-    def _depth_to_flow(self, depth):
-        """根据水深计算流量（Manning公式）"""
-        area = self._get_wetted_area(depth)
-        perimeter = self._get_wetted_perimeter(depth)
-        hydraulic_radius = area / perimeter if perimeter > 0 else 0
-
-        # Manning公式: Q = (1/n) * A * R^(2/3) * S^(1/2)
-        flow = (1/self.roughness) * area * (hydraulic_radius ** (2/3)) * (self.bottom_slope ** 0.5)
-        return flow * 60  # 转换为 m³/min
-
-    def _calculate_muskingum_storage(self, depth, inflow, outflow):
-        """
-        计算Muskingum蓄量
-        S = K[X*I + (1-X)*O] + 棱柱蓄量
-
-        棱柱蓄量基于水深和断面
-        楔形蓄量基于入流出流差异
-        """
-        # 棱柱蓄量（基于平均水深）
-        prism_storage = self._get_wetted_area(depth) * self.length
-
-        # Muskingum楔形蓄量修正
-        wedge_storage = self.muskingum_K * (
-            self.muskingum_X * inflow + (1 - self.muskingum_X) * outflow
-        )
-
-        total_storage = prism_storage + wedge_storage
-        return max(total_storage, 0.0)
-
-    def depth_to_storage(self, depth, inflow, outflow):
-        """水深+流量转换为蓄水量（考虑Muskingum关系）"""
-        return self._calculate_muskingum_storage(depth, inflow, outflow)
-
-    def storage_to_depth(self, storage, inflow, outflow):
-        """蓄水量转换为水深（考虑Muskingum关系，迭代求解）"""
-        # 迭代求解：给定蓄量和流量，反算水深
-        depth_guess = self.current_depth
-
-        for _ in range(5):  # 简单迭代
-            calc_storage = self._calculate_muskingum_storage(depth_guess, inflow, outflow)
-            error = storage - calc_storage
-
-            # 简单调整
-            area = self._get_wetted_area(depth_guess)
-            if area > 0:
-                depth_correction = error / (self.length * (self.width + 2 * self.side_slope * depth_guess))
-                depth_guess += depth_correction * 0.5  # 阻尼
-
-            depth_guess = np.clip(depth_guess, self.target_depth * 0.3, self.target_depth * 2.0)
-
-        return depth_guess
-
-    def update_state(self, inflow, outflow, downstream_depth, dt):
-        """
-        更新池段状态（使用Muskingum方法）
-
-        Args:
-            inflow: 上游入流 (m³/min)
-            outflow: 下游出流 (m³/min)
-            downstream_depth: 下游水深 (m)
-            dt: 时间步长 (分钟)
-
-        Returns:
-            new_depth: 更新后的水深 (m)
-        """
-        # 顶托效应：下游水深影响出流
-        backwater_effect = self.backwater_coeff * (
-            downstream_depth - self.target_depth
-        )
-        adjusted_outflow = outflow * (1 - backwater_effect)
-
-        # 保存当前入流出流用于Muskingum计算
-        self.current_inflow = inflow
-        self.current_outflow = adjusted_outflow
-
-        # 水量平衡：dS/dt = I - O
-        dStorage = (inflow - adjusted_outflow) * dt
-        new_storage = self.current_storage + dStorage
-
-        # 使用新的蓄量和流量反算水深（考虑Muskingum关系）
-        new_depth = self.storage_to_depth(new_storage, inflow, adjusted_outflow)
-
-        # 限制在合理范围内
-        new_depth = np.clip(new_depth, self.target_depth * 0.3, self.target_depth * 2.0)
-
-        # 重新计算蓄量（保证一致性）
-        new_storage = self._calculate_muskingum_storage(new_depth, inflow, adjusted_outflow)
-
-        # 更新状态
-        self.current_storage = new_storage
-        self.current_depth = new_depth
-
-        # 更新延迟队列
-        self.inflow_history.append(inflow)
-
-        return self.current_depth
-
-    def get_delayed_inflow(self):
-        """获取延迟后的入流（用于下游池段）"""
-        if len(self.inflow_history) > 0:
-            return self.inflow_history[0]
-        return 0.0
-
-
-class Gate:
-    """闸门控制器"""
-
-    def __init__(self, gate_id, max_flow, min_flow=0):
-        self.gate_id = gate_id
-        self.max_flow = max_flow
-        self.min_flow = min_flow
-        self.current_opening = 0.5  # 初始开度50%
-
-    def set_flow(self, target_flow):
-        """设置目标流量"""
-        flow = np.clip(target_flow, self.min_flow, self.max_flow)
-        self.current_opening = flow / self.max_flow
-        return flow
-
-    def get_flow(self):
-        """获取当前流量"""
-        return self.current_opening * self.max_flow
+from Feas.canal import IDZCanalPool, Gate, CanalMPCController
 
 
 class CanalSystem:
@@ -371,96 +154,6 @@ class CanalSystem:
         }
 
 
-class CanalMPCController:
-    """渠道MPC控制器"""
-
-    def __init__(
-        self,
-        canal_system,
-        prediction_horizon=12,  # 60分钟/5分钟
-        control_horizon=6,  # 30分钟/5分钟
-        dt=5,
-    ):
-        self.system = canal_system
-        self.prediction_horizon = prediction_horizon
-        self.control_horizon = control_horizon
-        self.dt = dt
-
-        # 权重参数
-        self.depth_weight = 100.0  # 水深偏差权重
-        self.control_weight = 1.0  # 控制变化权重
-        self.terminal_weight = 200.0  # 终端状态权重
-
-    def optimize(self, current_depths, offtake_forecast):
-        """
-        MPC优化
-
-        Args:
-            current_depths: 当前水深
-            offtake_forecast: 未来取水预测 [time][pool_id]
-
-        Returns:
-            optimal_gate_flows: 最优闸门流量序列
-        """
-        # 简化的MPC优化（基于启发式规则）
-        # 在实际应用中应该使用优化求解器
-
-        optimal_flows = []
-
-        # 对每个控制步长进行优化
-        for t in range(self.control_horizon):
-            gate_flows = []
-
-            for i, pool in enumerate(self.system.pools):
-                # 目标：维持水深接近目标值
-                depth_error = pool.current_depth - pool.target_depth
-
-                # 计算期望的流量调整
-                # 如果水深高于目标，增加出流
-                # 如果水深低于目标，减少出流
-
-                if i == 0:
-                    # 第一个闸门：根据池段1的水深调整
-                    base_flow = self.system.gates[0].max_flow * 0.6
-                    adjustment = -depth_error * 1.5  # 进一步降低增益（反应更慢，允许更多波动）
-                    gate_flows.append(
-                        np.clip(
-                            base_flow + adjustment,
-                            self.system.gates[0].min_flow,
-                            self.system.gates[0].max_flow,
-                        )
-                    )
-                else:
-                    # 中间闸门：平衡上下游
-                    base_flow = gate_flows[-1]  # 跟随上游
-                    adjustment = -depth_error * 1.2  # 进一步降低增益
-                    gate_flows.append(
-                        np.clip(
-                            base_flow + adjustment,
-                            self.system.gates[i].min_flow,
-                            self.system.gates[i].max_flow,
-                        )
-                    )
-
-            # 最后一个闸门
-            base_flow = gate_flows[-1]
-            last_pool = self.system.pools[-1]
-            depth_error = last_pool.current_depth - last_pool.target_depth
-            adjustment = -depth_error * 1.3  # 进一步降低增益
-            gate_flows.append(
-                np.clip(
-                    base_flow + adjustment,
-                    self.system.gates[-1].min_flow,
-                    self.system.gates[-1].max_flow,
-                )
-            )
-
-            optimal_flows.append(gate_flows)
-
-        # 返回第一个控制动作
-        return optimal_flows[0] if optimal_flows else [20] * 5
-
-
 def create_demand_scenario(scenario_type="normal", dt=10):
     """创建需求场景（适应不同时间步长）"""
     duration = 180  # 3小时，180分钟
@@ -473,32 +166,41 @@ def create_demand_scenario(scenario_type="normal", dt=10):
 
     scenarios = {
         "normal": {
-            "description": "正常运行，稳定需求",
+            "description": "Normal Operation - Steady Demand",
             "pool1": [2.0] * timesteps,
             "pool2": [3.0] * timesteps,
             "pool3": [2.5] * timesteps,
         },
         "demand_change": {
-            "description": "需求突变",
-            "pool1": [2.0] * steps_before + [5.0] * steps_during + [2.0] * steps_after,
-            "pool2": [3.0] * steps_before + [1.0] * steps_during + [3.0] * steps_after,
+            "description": "Step Change in Demand",
+            "pool1": [2.0] * steps_before + [5.0] * (steps_during + steps_after),
+            "pool2": [3.0] * steps_before + [1.0] * (steps_during + steps_after),
             "pool3": [2.5] * timesteps,
         },
+        "cascading_demand": {
+            "description": "Cascading Offtake Demand Increases",
+            # Pool 1: 需求在60min时增加
+            "pool1": [2.0] * int(60/dt) + [6.0] * (timesteps - int(60/dt)),
+            # Pool 2: 需求在75min时增加
+            "pool2": [3.0] * int(75/dt) + [7.0] * (timesteps - int(75/dt)),
+            # Pool 3: 需求在90min时增加
+            "pool3": [2.5] * int(90/dt) + [6.5] * (timesteps - int(90/dt)),
+        },
         "peak_demand": {
-            "description": "高峰需求",
+            "description": "Peak Demand with Sinusoidal Variation",
             "pool1": [2.0 + 3.0 * np.sin(i * 2 * np.pi / timesteps) for i in range(timesteps)],
             "pool2": [3.0 + 2.0 * np.sin((i + timesteps//4) * 2 * np.pi / timesteps) for i in range(timesteps)],
             "pool3": [2.5 + 1.5 * np.sin((i + timesteps//2) * 2 * np.pi / timesteps) for i in range(timesteps)],
         },
         "gate_failure": {
-            "description": "闸门故障（Gate 2流量受限）",
+            "description": "Gate Failure (Gate 2 Flow Constrained)",
             "pool1": [2.0] * timesteps,
             "pool2": [3.0] * timesteps,
             "pool3": [2.5] * timesteps,
             "gate_failure": {
                 "gate_id": 2,
-                "start_time": int(100 / dt),  # 100分钟时故障
-                "duration": int(50 / dt),     # 持续50分钟
+                "start_time": int(100 / dt),  # Failure at 100 min
+                "duration": int(50 / dt),     # Duration 50 min
                 "max_flow_reduction": 0.5,
             },
         },
@@ -602,9 +304,22 @@ def run_mpc_simulation(scenario_type="normal", dt=15):
         ]
 
         # MPC使用带噪声的测量值
-        offtake_forecast = []  # 简化：使用预测值
+        # 构建offtake预测序列（预测时域内假设需求保持当前预测值）
+        offtake_forecast = []
+        for t in range(mpc.prediction_horizon):
+            # 每个时间步的offtake预测 [offtake1, offtake2, offtake3]
+            offtake_forecast.append([
+                offtakes_predicted[1],
+                offtakes_predicted[2],
+                offtakes_predicted[3]
+            ])
 
-        optimal_flows = mpc.optimize(measured_depths, offtake_forecast)
+        # 使用带质量平衡约束的优化方法
+        optimal_flows = mpc.optimize_with_mass_balance(
+            measured_depths,
+            offtake_forecast,
+            current_gate_flows=previous_gate_flows
+        )
 
         # ====== 扰动3：执行器速率限制（闸门调节速度限制）======
         # 真实闸门每10分钟最多调整5-10%的流量
@@ -725,114 +440,262 @@ def calculate_performance_metrics(df, canal):
 
 
 def visualize_results(df, metrics, scenario, output_dir):
-    """可视化结果"""
-    configure_chinese_font()
+    """Visualize MPC simulation results (Improved: show MPC predictive control with event markers and zoom-in)"""
 
-    fig = plt.figure(figsize=(18, 14))
-    gs = fig.add_gridspec(4, 2, hspace=0.3, wspace=0.3)
+    fig = plt.figure(figsize=(20, 20))  # Increased height for 6 rows
+    gs = fig.add_gridspec(6, 2, hspace=0.35, wspace=0.25)
 
     scenario_desc = scenario.get("description", "Unknown")
-    fig.suptitle(f"渠道MPC控制仿真结果 - {scenario_desc}", fontsize=16, fontweight="bold")
+    fig.suptitle(f"Canal MPC Control Simulation Results - {scenario_desc}", fontsize=16, fontweight="bold")
 
-    # 子图1：各池段水深变化（放大y轴显示波动）
-    ax = fig.add_subplot(gs[0, :])
-
-    # 计算合适的y轴范围（目标值±15cm）
     pool_targets = [2.0, 1.8, 1.6, 1.5]
 
+    # Detect demand change event (for step change scenario)
+    demand_change_time = None
+    demand_change_times = []  # For cascading scenarios
+
+    if "cascading" in scenario.get("description", "").lower():
+        # Cascading demand scenario: multiple events at different times
+        demand_change_times = [60, 75, 90]  # Pool 1, 2, 3 demand changes
+    elif "demand_change" in scenario.get("description", "").lower() or "step change" in scenario.get("description", "").lower():
+        # Single demand change event
+        demand_change_time = 60
+
+    # 子图1-4：每个池段单独显示（左侧4个子图）
     for i in range(1, 5):
+        ax = fig.add_subplot(gs[i-1, 0])
+
         target = pool_targets[i-1]
-        ax.plot(df["time"], df[f"pool{i}_depth"], label=f"Pool {i} (目标{target}m)", linewidth=2.5, alpha=0.8)
-        # 添加目标水深线
-        ax.axhline(y=target, linestyle="--", color=f"C{i-1}", alpha=0.6, linewidth=1.5)
 
-    # 动态设置y轴范围：基于实际数据范围
-    all_depths = []
-    for i in range(1, 5):
-        all_depths.extend(df[f"pool{i}_depth"].values)
+        # Plot water depth
+        ax.plot(df["time"], df[f"pool{i}_depth"],
+                label=f"Actual Depth", linewidth=2.5, alpha=0.9, color=f"C{i-1}")
 
-    y_min = min(all_depths) - 0.05
-    y_max = max(all_depths) + 0.05
-    ax.set_ylim(y_min, y_max)
+        # Target depth line
+        ax.axhline(y=target, linestyle="--", color="red",
+                  alpha=0.7, linewidth=2, label="Target Depth")
 
-    ax.set_xlabel("时间 (分钟)", fontsize=11)
-    ax.set_ylabel("水深 (m)", fontsize=11)
-    ax.set_title("各池段水深变化（放大显示波动细节）", fontsize=12, fontweight="bold")
-    ax.legend(loc="best", fontsize=9)
-    ax.grid(True, alpha=0.3, linestyle=':')
+        # Add demand change event marker(s)
+        if demand_change_times:
+            for idx, t in enumerate(demand_change_times):
+                label = f'Pool {idx+1} Demand Change' if idx == 0 else None
+                ax.axvline(x=t, color='orange', linestyle=':', linewidth=2.5,
+                          alpha=0.8, label=label if idx == 0 else '')
+        elif demand_change_time is not None:
+            ax.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
+                      alpha=0.8, label='Demand Change Event')
 
-    # 子图2：闸门流量
-    ax = fig.add_subplot(gs[1, 0])
+        # Fixed y-axis range: target ±15cm
+        y_margin = 0.15  # 15cm margin
+        ax.set_ylim(target - y_margin, target + y_margin)
+
+        ax.set_xlabel("Time (min)", fontsize=10)
+        ax.set_ylabel("Water Depth (m)", fontsize=10)
+        ax.set_title(f"Pool {i} Depth Control (Target: {target}m)",
+                    fontsize=11, fontweight="bold")
+        ax.legend(loc="upper right", fontsize=9)
+        ax.grid(True, alpha=0.3, linestyle=':')
+
+    # Top right: Gate flow control (showing MPC feedforward control)
+    ax = fig.add_subplot(gs[0, 1])
+
+    # Calculate dynamic y-axis range for gate flows
+    all_gate_flows = []
     for i in range(5):
-        ax.plot(df["time"], df[f"gate{i}_flow"], label=f"Gate {i}", linewidth=2)
-    ax.set_xlabel("时间 (分钟)")
-    ax.set_ylabel("流量 (m³/min)")
-    ax.set_title("闸门流量控制")
-    ax.legend(loc="best")
+        all_gate_flows.extend(df[f"gate{i}_flow"].values)
+        ax.plot(df["time"], df[f"gate{i}_flow"], label=f"Gate {i}", linewidth=2, alpha=0.8)
+
+    # Add demand change event marker(s)
+    if demand_change_times:
+        for idx, t in enumerate(demand_change_times):
+            label = 'Demand Changes' if idx == 0 else ''
+            ax.axvline(x=t, color='orange', linestyle=':', linewidth=2.5,
+                      alpha=0.8, label=label)
+    elif demand_change_time is not None:
+        ax.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
+                  alpha=0.8, label='Demand Change')
+
+    # Dynamic y-axis range based on actual gate flow data
+    gate_flow_min = min(all_gate_flows)
+    gate_flow_max = max(all_gate_flows)
+    gate_flow_margin = max(1.0, (gate_flow_max - gate_flow_min) * 0.15)
+    ax.set_ylim(gate_flow_min - gate_flow_margin, gate_flow_max + gate_flow_margin)
+
+    ax.set_xlabel("Time (min)", fontsize=10)
+    ax.set_ylabel("Flow Rate (m³/min)", fontsize=10)
+    ax.set_title("Gate Flow Control (MPC Feedforward)", fontsize=11, fontweight="bold")
+    ax.legend(loc="best", fontsize=8, ncol=3)
     ax.grid(True, alpha=0.3)
 
-    # 子图3：取水需求
+    # Middle right: Offtake demand (disturbance)
     ax = fig.add_subplot(gs[1, 1])
     for i in range(1, 4):
-        ax.plot(df["time"], df[f"offtake{i}"], label=f"Offtake {i}", linewidth=2)
-    ax.set_xlabel("时间 (分钟)")
-    ax.set_ylabel("取水量 (m³/min)")
-    ax.set_title("取水需求变化")
-    ax.legend(loc="best")
+        ax.plot(df["time"], df[f"offtake{i}"], label=f"Offtake {i}",
+               linewidth=2.5, marker='o', markersize=4, alpha=0.8)
+
+    # Add demand change event marker(s)
+    if demand_change_times:
+        for idx, t in enumerate(demand_change_times):
+            label = 'Events' if idx == 0 else ''
+            ax.axvline(x=t, color='orange', linestyle=':', linewidth=2.5,
+                      alpha=0.8, label=label)
+    elif demand_change_time is not None:
+        ax.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=2.5,
+                  alpha=0.8, label='Event')
+
+    # Fixed y-axis range
+    ax.set_ylim(0, 8)
+    ax.set_xlabel("Time (min)", fontsize=10)
+    ax.set_ylabel("Offtake Demand (m³/min)", fontsize=10)
+    ax.set_title("Offtake Demand Variation (External Disturbance)", fontsize=11, fontweight="bold")
+    ax.legend(loc="best", fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # 子图4：水深偏差（放大显示）
-    ax = fig.add_subplot(gs[2, 0])
+    # Bottom right: Depth deviation summary
+    ax = fig.add_subplot(gs[2, 1])
     targets = [2.0, 1.8, 1.6, 1.5]
 
     all_deviations = []
     for i in range(1, 5):
         deviation = df[f"pool{i}_depth"] - targets[i - 1]
-        ax.plot(df["time"], deviation * 100, label=f"Pool {i}", linewidth=2, alpha=0.8)  # 转换为cm
+        ax.plot(df["time"], deviation * 100, label=f"Pool {i}", linewidth=2, alpha=0.8)  # Convert to cm
         all_deviations.extend(deviation.values * 100)
 
     ax.axhline(y=0, color="black", linestyle="--", alpha=0.7, linewidth=2)
 
-    # 动态设置y轴范围
-    dev_max = max(abs(min(all_deviations)), abs(max(all_deviations)))
-    ax.set_ylim(-dev_max * 1.1, dev_max * 1.1)
+    # Fixed y-axis range: ±15cm
+    ax.set_ylim(-15, 15)
 
-    ax.set_xlabel("时间 (分钟)", fontsize=10)
-    ax.set_ylabel("水深偏差 (cm)", fontsize=10)
-    ax.set_title("水深偏差（实际-目标）", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Time (min)", fontsize=10)
+    ax.set_ylabel("Depth Deviation (cm)", fontsize=10)
+    ax.set_title("Depth Deviation Summary (Actual - Target)", fontsize=11, fontweight="bold")
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3, linestyle=':')
 
-    # 子图5：闸门调节频率
-    ax = fig.add_subplot(gs[2, 1])
+    # Gate adjustment frequency
+    ax = fig.add_subplot(gs[3, 1])
     for i in range(5):
         flow_changes = np.abs(np.diff(df[f"gate{i}_flow"]))
-        ax.plot(df["time"][1:], flow_changes, label=f"Gate {i}", linewidth=2)
-    ax.set_xlabel("时间 (分钟)")
-    ax.set_ylabel("流量变化率 (m³/min/步)")
-    ax.set_title("闸门调节频率")
-    ax.legend(loc="best")
+        ax.plot(df["time"][1:], flow_changes, label=f"Gate {i}", linewidth=1.5, alpha=0.8)
+
+    # Fixed y-axis range
+    ax.set_ylim(0, 6)
+    ax.set_xlabel("Time (min)", fontsize=10)
+    ax.set_ylabel("Flow Change Rate (m³/min/step)", fontsize=10)
+    ax.set_title("Gate Adjustment Frequency (Control Smoothness)", fontsize=11, fontweight="bold")
+    ax.legend(loc="best", fontsize=8, ncol=3)
     ax.grid(True, alpha=0.3)
 
-    # 子图6：性能指标汇总
-    ax = fig.add_subplot(gs[3, :])
+    # === NEW: Zoomed-in view of key time window ===
+    if demand_change_time is not None or demand_change_times:
+        ax_zoom = fig.add_subplot(gs[4, :])
+
+        # Filter data for zoom window (wider window for cascading scenario)
+        if demand_change_times:
+            zoom_start, zoom_end = 45, 120  # Wider window to show all cascading events
+        else:
+            zoom_start, zoom_end = 45, 90
+        mask = (df["time"] >= zoom_start) & (df["time"] <= zoom_end)
+        df_zoom = df[mask]
+
+        # Create twin axes for different scales
+        ax_zoom_flow = ax_zoom
+        ax_zoom_depth = ax_zoom.twinx()
+
+        # Plot offtake demand (step change) - LEFT Y-AXIS
+        ax_zoom_flow.plot(df_zoom["time"], df_zoom["offtake1"],
+                         color='red', linestyle='--', linewidth=3, marker='s', markersize=5,
+                         label='Offtake 1 (Demand)', alpha=0.8)
+        ax_zoom_flow.plot(df_zoom["time"], df_zoom["offtake2"],
+                         color='darkred', linestyle='--', linewidth=3, marker='s', markersize=5,
+                         label='Offtake 2 (Demand)', alpha=0.8)
+
+        # Plot gate response (MPC action) - LEFT Y-AXIS
+        ax_zoom_flow.plot(df_zoom["time"], df_zoom["gate0_flow"],
+                         color='green', linewidth=2.5, marker='o', markersize=4,
+                         label='Gate 0 (MPC Action)', alpha=0.9)
+        ax_zoom_flow.plot(df_zoom["time"], df_zoom["gate1_flow"],
+                         color='blue', linewidth=2.5, marker='o', markersize=4,
+                         label='Gate 1 (MPC Action)', alpha=0.9)
+
+        # Plot water depth response - RIGHT Y-AXIS
+        ax_zoom_depth.plot(df_zoom["time"], df_zoom["pool1_depth"],
+                          color='purple', linewidth=2.5, linestyle='-', marker='^', markersize=4,
+                          label='Pool 1 Depth (Response)', alpha=0.8)
+
+        # Event marker(s)
+        if demand_change_times:
+            for idx, t in enumerate(demand_change_times):
+                label = 'Demand Change Events' if idx == 0 else ''
+                ax_zoom_flow.axvline(x=t, color='orange', linestyle=':', linewidth=3,
+                                    alpha=0.9, label=label)
+        elif demand_change_time is not None:
+            ax_zoom_flow.axvline(x=demand_change_time, color='orange', linestyle=':', linewidth=3,
+                                alpha=0.9, label='Demand Change Event')
+
+        # Calculate dynamic y-axis range for flow (only gate flows for tighter range)
+        zoom_gate_flows = []
+        zoom_gate_flows.extend(df_zoom["gate0_flow"].values)
+        zoom_gate_flows.extend(df_zoom["gate1_flow"].values)
+        zoom_flow_min = min(zoom_gate_flows)
+        zoom_flow_max = max(zoom_gate_flows)
+        zoom_flow_margin = max(1.0, (zoom_flow_max - zoom_flow_min) * 0.2)
+        ax_zoom_flow.set_ylim(zoom_flow_min - zoom_flow_margin, zoom_flow_max + zoom_flow_margin)
+
+        # Annotations with dynamic positioning
+        flow_mid = (zoom_flow_min + zoom_flow_max) / 2
+        if demand_change_times:
+            # For cascading scenario, annotate the sequential control effect
+            ax_zoom_flow.annotate('MPC coordinates\nsequential adjustments',
+                                 xy=(75, flow_mid),
+                                 xytext=(100, flow_mid + zoom_flow_margin * 0.5),
+                                 arrowprops=dict(arrowstyle='->', color='green', lw=2),
+                                 fontsize=10, color='green', fontweight='bold',
+                                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
+        elif demand_change_time is not None:
+            ax_zoom_flow.annotate('MPC anticipates\nand acts early',
+                                 xy=(demand_change_time-5, flow_mid),
+                                 xytext=(demand_change_time-20, flow_mid + zoom_flow_margin * 0.5),
+                                 arrowprops=dict(arrowstyle='->', color='green', lw=2),
+                                 fontsize=10, color='green', fontweight='bold',
+                                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
+
+        # Labels and formatting
+        ax_zoom_flow.set_xlabel("Time (min)", fontsize=11, fontweight='bold')
+        ax_zoom_flow.set_ylabel("Flow Rate (m³/min)", fontsize=11, color='black')
+        ax_zoom_depth.set_ylabel("Water Depth (m)", fontsize=11, color='purple')
+
+        title_text = f"Zoomed View: MPC Predictive Control in Action ({zoom_start}-{zoom_end} min)"
+        ax_zoom_flow.set_title(title_text, fontsize=12, fontweight="bold")
+
+        # Legends
+        lines1, labels1 = ax_zoom_flow.get_legend_handles_labels()
+        lines2, labels2 = ax_zoom_depth.get_legend_handles_labels()
+        ax_zoom_flow.legend(lines1 + lines2, labels1 + labels2,
+                           loc='upper left', fontsize=9, ncol=2)
+
+        ax_zoom_flow.grid(True, alpha=0.3, linestyle=':')
+        ax_zoom_flow.set_xlim(zoom_start, zoom_end)
+
+    # Performance metrics summary
+    ax = fig.add_subplot(gs[5, :])
     ax.axis("off")
 
-    # 创建性能指标表格
-    metrics_text = "性能指标汇总\n" + "=" * 80 + "\n\n"
+    # Create performance metrics table
+    metrics_text = "Performance Metrics Summary\n" + "=" * 80 + "\n\n"
 
-    metrics_text += "水深控制精度:\n"
+    metrics_text += "Depth Control Accuracy:\n"
     for i in range(1, 5):
         mae = metrics[f"pool{i}_mae"]
         rmse = metrics[f"pool{i}_rmse"]
         max_dev = metrics[f"pool{i}_max_dev"]
-        metrics_text += f"  Pool {i}: MAE={mae:.4f}m, RMSE={rmse:.4f}m, 最大偏差={max_dev:.4f}m\n"
+        metrics_text += f"  Pool {i}: MAE={mae:.4f}m, RMSE={rmse:.4f}m, Max Deviation={max_dev:.4f}m\n"
 
-    metrics_text += "\n闸门控制平滑度:\n"
+    metrics_text += "\nGate Control Smoothness:\n"
     for i in range(5):
         avg_change = metrics[f"gate{i}_avg_change"]
         max_change = metrics[f"gate{i}_max_change"]
-        metrics_text += f"  Gate {i}: 平均变化={avg_change:.3f}, 最大变化={max_change:.3f} m³/min\n"
+        metrics_text += f"  Gate {i}: Avg Change={avg_change:.3f}, Max Change={max_change:.3f} m³/min\n"
 
     ax.text(
         0.1,
@@ -847,388 +710,205 @@ def visualize_results(df, metrics, scenario, output_dir):
 
     plt.tight_layout()
 
-    # 保存
+    # Save figure
     output_path = Path(output_dir) / f"mpc_simulation_{scenario_desc.replace(' ', '_')}.png"
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"\n✓ 可视化结果已保存: {output_path}")
+    print(f"\n✓ Visualization results saved: {output_path}")
     plt.close()
 
 
 def create_mpc_animation(df, scenario, output_dir, canal):
     """
-    创建MPC滚动优化控制的动态可视化（GIF动画）
+    Create MPC rolling optimization animation (GIF) - Improved layout
 
-    展示内容：
-    1. 各池段水深的实时变化
-    2. 闸门控制动作
-    3. 取水扰动
-    4. MPC预测时域的滚动效果
+    Layout: 4 rows x 2 columns (one row per pool)
+    - Left column: Water depth with zoomed y-axis (target ± 0.15m)
+    - Right column: Flow rates (inflow, outflow, offtake demand)
 
     Args:
-        df: 仿真结果数据
-        scenario: 场景配置
-        output_dir: 输出目录
-        canal: 渠道系统对象
+        df: Simulation result data
+        scenario: Scenario configuration
+        output_dir: Output directory
+        canal: Canal system object
     """
-    configure_chinese_font()
-
     scenario_desc = scenario.get("description", "Unknown")
-    print(f"\n生成MPC滚动优化动画 - {scenario_desc}...")
+    print(f"\nGenerating improved MPC animation - {scenario_desc}...")
 
-    # 设置参数
-    prediction_horizon = 12  # 预测时域（步）
-    dt = 5  # 时间步长（分钟）
+    # Parameters
+    prediction_horizon = 12  # Prediction horizon (steps)
+    dt = 15  # Time step from actual simulation (minutes)
 
-    # 提取数据
+    # Extract data
     times = df["time"].values
-    pool_targets = [2.0, 1.8, 1.6, 1.5]  # 各池段目标水深
+    pool_targets = [2.0, 1.8, 1.6, 1.5]  # Target depths for each pool
 
-    # 创建图形
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.25)
+    # Pre-calculate dynamic y-axis ranges for each pool to show variations clearly
+    depth_ranges = []
+    flow_ranges = []
 
-    # 子图1: 水深变化（左上，跨2列）
-    ax_depth = fig.add_subplot(gs[0, :])
+    for i in range(4):
+        pool_idx = i + 1
 
-    # 子图2: 闸门流量（左中）
-    ax_gates = fig.add_subplot(gs[1, 0])
+        # Calculate depth range (use actual data range with small margin)
+        depth_data = df[f"pool{pool_idx}_depth"].values
+        depth_min = depth_data.min()
+        depth_max = depth_data.max()
+        depth_margin = max(0.05, (depth_max - depth_min) * 0.2)  # At least 5cm margin, or 20% of range
+        depth_ranges.append((depth_min - depth_margin, depth_max + depth_margin))
 
-    # 子图3: 取水需求（右中）
-    ax_offtakes = fig.add_subplot(gs[1, 1])
+        # Calculate flow range for this pool - ONLY use gate flows (exclude offtake for tighter range)
+        # This makes gate flow variations more visible
+        flows = []
+        flows.extend(df[f"gate{i}_flow"].values)
+        flows.extend(df[f"gate{i+1}_flow"].values)
 
-    # 子图4: 水深偏差（左下）
-    ax_deviation = fig.add_subplot(gs[2, 0])
+        flow_min = min(flows)
+        flow_max = max(flows)
+        flow_margin = max(0.5, (flow_max - flow_min) * 0.1)  # Reduced margin: 0.5 m³/min or 10% of range
+        flow_ranges.append((flow_min - flow_margin, flow_max + flow_margin))
 
-    # 子图5: 控制动作（右下）
-    ax_control = fig.add_subplot(gs[2, 1])
+    # Create figure with 4 rows x 2 columns layout
+    fig = plt.figure(figsize=(18, 16))
+    gs = fig.add_gridspec(4, 2, hspace=0.3, wspace=0.25)
 
-    # 子图6: 信息面板（底部，跨2列）
-    ax_info = fig.add_subplot(gs[3, :])
-    ax_info.axis("off")
+    # Create subplots: 4 rows (one per pool), 2 columns (depth, flow)
+    axes_depth = []  # Left column: depth plots
+    axes_flow = []   # Right column: flow plots
 
-    # 初始化绘图元素
-    depth_lines = []
-    target_lines = []
-    gate_lines = []
-    offtake_lines = []
-    deviation_lines = []
-    control_lines = []
+    for i in range(4):
+        ax_d = fig.add_subplot(gs[i, 0])  # Depth subplot
+        ax_f = fig.add_subplot(gs[i, 1])  # Flow subplot
+        axes_depth.append(ax_d)
+        axes_flow.append(ax_f)
 
-    # 当前时刻标记线
-    current_time_marker_depth = None
-    current_time_marker_gates = None
-    current_time_marker_offtakes = None
-
-    # 预测时域阴影
-    prediction_shade = None
-
-    # 初始化函数
-    def init():
-        # 水深子图
-        ax_depth.clear()
-        ax_depth.set_xlim(0, times[-1])
-        ax_depth.set_ylim(0.5, 2.5)
-        ax_depth.set_xlabel("时间 (分钟)", fontsize=11)
-        ax_depth.set_ylabel("水深 (m)", fontsize=11)
-        ax_depth.set_title("各池段水深变化（实时+预测）", fontsize=12, fontweight="bold")
-        ax_depth.grid(True, alpha=0.3)
-
-        # 闸门流量子图
-        ax_gates.clear()
-        ax_gates.set_xlim(0, times[-1])
-        ax_gates.set_ylim(0, 45)
-        ax_gates.set_xlabel("时间 (分钟)", fontsize=10)
-        ax_gates.set_ylabel("流量 (m³/min)", fontsize=10)
-        ax_gates.set_title("闸门控制流量", fontsize=11, fontweight="bold")
-        ax_gates.grid(True, alpha=0.3)
-
-        # 取水需求子图
-        ax_offtakes.clear()
-        ax_offtakes.set_xlim(0, times[-1])
-        ax_offtakes.set_ylim(0, 8)
-        ax_offtakes.set_xlabel("时间 (分钟)", fontsize=10)
-        ax_offtakes.set_ylabel("取水量 (m³/min)", fontsize=10)
-        ax_offtakes.set_title("取水扰动", fontsize=11, fontweight="bold")
-        ax_offtakes.grid(True, alpha=0.3)
-
-        # 水深偏差子图
-        ax_deviation.clear()
-        ax_deviation.set_xlim(0, times[-1])
-        ax_deviation.set_ylim(-0.3, 0.3)
-        ax_deviation.set_xlabel("时间 (分钟)", fontsize=10)
-        ax_deviation.set_ylabel("水深偏差 (m)", fontsize=10)
-        ax_deviation.set_title("水深偏差（实际-目标）", fontsize=11, fontweight="bold")
-        ax_deviation.axhline(y=0, color="black", linestyle="--", alpha=0.5)
-        ax_deviation.grid(True, alpha=0.3)
-
-        # 控制动作子图
-        ax_control.clear()
-        ax_control.set_xlim(0, times[-1])
-        ax_control.set_ylim(0, 5)
-        ax_control.set_xlabel("时间 (分钟)", fontsize=10)
-        ax_control.set_ylabel("流量变化 (m³/min)", fontsize=10)
-        ax_control.set_title("闸门调节幅度", fontsize=11, fontweight="bold")
-        ax_control.grid(True, alpha=0.3)
-
-        return []
-
-    # 更新函数（每一帧）
+    # Update function (called for each frame)
     def update(frame):
-        nonlocal current_time_marker_depth, current_time_marker_gates
-        nonlocal current_time_marker_offtakes, prediction_shade
-
-        # 当前时刻
         current_idx = frame
         current_time = times[current_idx]
 
-        # 清除旧的图形元素
-        ax_depth.clear()
-        ax_gates.clear()
-        ax_offtakes.clear()
-        ax_deviation.clear()
-        ax_control.clear()
-        ax_info.clear()
-        ax_info.axis("off")
+        # Clear all subplots
+        for ax in axes_depth + axes_flow:
+            ax.clear()
 
-        # === 子图1: 水深变化 ===
-        ax_depth.set_xlim(0, times[-1])
-
-        # 动态y轴范围（基于当前数据）
-        current_depths = [df[f"pool{i}_depth"].iloc[:current_idx+1].values for i in range(1, 5)]
-        all_current = [d for depths in current_depths for d in depths]
-        if len(all_current) > 0:
-            y_min = min(all_current) - 0.08
-            y_max = max(all_current) + 0.08
-            ax_depth.set_ylim(y_min, y_max)
-        else:
-            ax_depth.set_ylim(1.3, 2.1)
-
-        ax_depth.set_xlabel("时间 (分钟)", fontsize=11)
-        ax_depth.set_ylabel("水深 (m)", fontsize=11)
-        ax_depth.set_title("各池段水深变化（实时+MPC预测时域，放大显示）", fontsize=12, fontweight="bold")
-        ax_depth.grid(True, alpha=0.3)
-
-        # 绘制历史水深（已发生）
+        # Colors for each pool
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
-        for i in range(1, 5):
-            # 历史轨迹（实线）
-            ax_depth.plot(
+
+        # Plot each pool (4 rows)
+        for i in range(4):
+            pool_idx = i + 1
+            target = pool_targets[i]
+
+            # === Left subplot: Water depth (zoomed in) ===
+            ax_d = axes_depth[i]
+
+            # Plot depth curve
+            ax_d.plot(
                 times[:current_idx+1],
-                df[f"pool{i}_depth"][:current_idx+1],
-                color=colors[i-1],
-                linewidth=2.5,
-                label=f"Pool {i}",
+                df[f"pool{pool_idx}_depth"][:current_idx+1],
+                color=colors[i],
+                linewidth=3,
+                label=f"Actual Depth",
                 alpha=0.9
             )
 
-            # 目标水深（虚线）
-            ax_depth.axhline(
-                y=pool_targets[i-1],
-                color=colors[i-1],
-                linestyle="--",
-                alpha=0.4,
-                linewidth=1.5
-            )
+            # Target line
+            ax_d.axhline(y=target, color='red', linestyle='--', linewidth=2, alpha=0.7, label="Target")
 
-        # 预测时域可视化（阴影区域）
-        prediction_end = min(current_time + prediction_horizon * dt, times[-1])
-        ax_depth.axvspan(
-            current_time,
-            prediction_end,
-            alpha=0.15,
-            color="yellow",
-            label="MPC预测时域"
-        )
+            # Current time marker
+            ax_d.axvline(x=current_time, color='green', linestyle='-', linewidth=2, alpha=0.5)
 
-        # 当前时刻标记
-        ax_depth.axvline(
-            x=current_time,
-            color="red",
-            linestyle="-",
-            linewidth=2.5,
-            alpha=0.7,
-            label="当前时刻"
-        )
+            # Set dynamic y-axis range to emphasize variations
+            ax_d.set_ylim(depth_ranges[i][0], depth_ranges[i][1])
+            ax_d.set_xlim(0, times[-1])
+            ax_d.set_ylabel("Depth (m)", fontsize=10)
+            ax_d.set_title(f"Pool {pool_idx} - Depth (Target: {target}m)", fontsize=11, fontweight='bold')
+            ax_d.grid(True, alpha=0.3)
+            ax_d.legend(loc='upper right', fontsize=8)
 
-        ax_depth.legend(loc="upper right", fontsize=9, ncol=2)
+            if i == 3:  # Only show x-label on bottom plot
+                ax_d.set_xlabel("Time (min)", fontsize=10)
 
-        # === 子图2: 闸门流量 ===
-        ax_gates.set_xlim(0, times[-1])
-        ax_gates.set_ylim(0, 45)
-        ax_gates.set_xlabel("时间 (分钟)", fontsize=10)
-        ax_gates.set_ylabel("流量 (m³/min)", fontsize=10)
-        ax_gates.set_title("闸门控制流量", fontsize=11, fontweight="bold")
-        ax_gates.grid(True, alpha=0.3)
+            # === Right subplot: Flow rates ===
+            ax_f = axes_flow[i]
 
-        for i in range(5):
-            ax_gates.plot(
+            # Upstream gate (inflow)
+            ax_f.plot(
                 times[:current_idx+1],
                 df[f"gate{i}_flow"][:current_idx+1],
-                linewidth=2,
-                label=f"Gate {i}",
-                alpha=0.8
-            )
-
-        ax_gates.axvline(x=current_time, color="red", linestyle="-", linewidth=2, alpha=0.5)
-        ax_gates.legend(loc="best", fontsize=8, ncol=3)
-
-        # === 子图3: 取水需求 ===
-        ax_offtakes.set_xlim(0, times[-1])
-        ax_offtakes.set_ylim(0, 8)
-        ax_offtakes.set_xlabel("时间 (分钟)", fontsize=10)
-        ax_offtakes.set_ylabel("取水量 (m³/min)", fontsize=10)
-        ax_offtakes.set_title("取水扰动（外部需求）", fontsize=11, fontweight="bold")
-        ax_offtakes.grid(True, alpha=0.3)
-
-        for i in range(1, 4):
-            ax_offtakes.plot(
-                times[:current_idx+1],
-                df[f"offtake{i}"][:current_idx+1],
+                color='green',
                 linewidth=2.5,
-                marker='o',
-                markersize=3,
-                label=f"Offtake {i}",
+                label=f"Gate {i} (Inflow)",
                 alpha=0.8
             )
 
-        ax_offtakes.axvline(x=current_time, color="red", linestyle="-", linewidth=2, alpha=0.5)
-        ax_offtakes.legend(loc="best", fontsize=9)
-
-        # === 子图4: 水深偏差（转换为cm）===
-        ax_deviation.set_xlim(0, times[-1])
-
-        all_devs = []
-        for i in range(1, 5):
-            deviation = (df[f"pool{i}_depth"][:current_idx+1] - pool_targets[i-1]) * 100  # 转cm
-            ax_deviation.plot(
+            # Downstream gate (outflow)
+            ax_f.plot(
                 times[:current_idx+1],
-                deviation,
-                linewidth=2,
-                label=f"Pool {i}",
+                df[f"gate{i+1}_flow"][:current_idx+1],
+                color='blue',
+                linewidth=2.5,
+                label=f"Gate {i+1} (Outflow)",
                 alpha=0.8
             )
-            all_devs.extend(deviation.values)
 
-        # 动态y轴
-        if len(all_devs) > 0:
-            dev_max = max(abs(min(all_devs)), abs(max(all_devs)))
-            ax_deviation.set_ylim(-dev_max * 1.2, dev_max * 1.2)
-        else:
-            ax_deviation.set_ylim(-15, 15)
-
-        ax_deviation.set_xlabel("时间 (分钟)", fontsize=10)
-        ax_deviation.set_ylabel("水深偏差 (cm)", fontsize=10)
-        ax_deviation.set_title("水深偏差（实际-目标）", fontsize=11, fontweight="bold")
-        ax_deviation.axhline(y=0, color="black", linestyle="--", alpha=0.6, linewidth=1.5)
-        ax_deviation.grid(True, alpha=0.3)
-
-        ax_deviation.axvline(x=current_time, color="red", linestyle="-", linewidth=2, alpha=0.5)
-        ax_deviation.legend(loc="best", fontsize=8, ncol=2)
-
-        # === 子图5: 控制动作幅度 ===
-        ax_control.set_xlim(0, times[-1])
-        ax_control.set_ylim(0, 5)
-        ax_control.set_xlabel("时间 (分钟)", fontsize=10)
-        ax_control.set_ylabel("流量变化 (m³/min)", fontsize=10)
-        ax_control.set_title("闸门调节幅度（控制平滑度）", fontsize=11, fontweight="bold")
-        ax_control.grid(True, alpha=0.3)
-
-        for i in range(5):
-            if current_idx > 0:
-                flow_changes = np.abs(np.diff(df[f"gate{i}_flow"][:current_idx+1]))
-                ax_control.plot(
-                    times[1:current_idx+1],
-                    flow_changes,
-                    linewidth=1.5,
-                    label=f"Gate {i}",
-                    alpha=0.7
+            # Offtake demand (if exists)
+            if pool_idx in [1, 2, 3]:
+                ax_f.plot(
+                    times[:current_idx+1],
+                    df[f"offtake{pool_idx}"][:current_idx+1],
+                    color='red',
+                    linestyle='--',
+                    linewidth=2,
+                    label=f"Offtake {pool_idx}",
+                    alpha=0.8
                 )
 
-        ax_control.axvline(x=current_time, color="red", linestyle="-", linewidth=2, alpha=0.5)
-        if current_idx > 0:
-            ax_control.legend(loc="best", fontsize=8, ncol=3)
+            # Current time marker
+            ax_f.axvline(x=current_time, color='green', linestyle='-', linewidth=2, alpha=0.5)
 
-        # === 子图6: 信息面板 ===
-        # 计算当前性能指标
-        current_depths = [df[f"pool{i}_depth"].iloc[current_idx] for i in range(1, 5)]
-        current_gates = [df[f"gate{i}_flow"].iloc[current_idx] for i in range(5)]
-        current_offtakes = [df[f"offtake{i}"].iloc[current_idx] for i in range(1, 4)]
+            # Set dynamic y-axis range to emphasize variations
+            ax_f.set_ylim(flow_ranges[i][0], flow_ranges[i][1])
+            ax_f.set_xlim(0, times[-1])
+            ax_f.set_ylabel("Flow (m³/min)", fontsize=10)
+            ax_f.set_title(f"Pool {pool_idx} - Flow Rates", fontsize=11, fontweight='bold')
+            ax_f.grid(True, alpha=0.3)
+            ax_f.legend(loc='upper right', fontsize=8)
 
-        # 计算水深偏差
-        deviations = [current_depths[i] - pool_targets[i] for i in range(4)]
-        max_deviation = max(abs(d) for d in deviations)
+            if i == 3:  # Only show x-label on bottom plot
+                ax_f.set_xlabel("Time (min)", fontsize=10)
 
-        # 故障检测
-        fault_status = ""
-        if "gate_failure" in scenario:
-            gf = scenario["gate_failure"]
-            if gf["start_time"] <= frame < gf["start_time"] + gf["duration"]:
-                fault_status = f"⚠️  故障中: Gate {gf['gate_id']} 流量受限 ({gf['max_flow_reduction']*100:.0f}%)"
-
-        info_text = f"""
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  MPC滚动优化控制 - 实时仿真                                                    时间: {current_time:.0f}/{times[-1]:.0f} 分钟  │
-├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                                          │
-│  当前状态:                                                                                               │
-│    水深: Pool1={current_depths[0]:.3f}m  Pool2={current_depths[1]:.3f}m  Pool3={current_depths[2]:.3f}m  Pool4={current_depths[3]:.3f}m      │
-│    偏差: Δ1={deviations[0]:+.3f}m    Δ2={deviations[1]:+.3f}m    Δ3={deviations[2]:+.3f}m    Δ4={deviations[3]:+.3f}m     最大: {max_deviation:.3f}m│
-│                                                                                                          │
-│  控制动作:                                                                                               │
-│    闸门: G0={current_gates[0]:.1f}  G1={current_gates[1]:.1f}  G2={current_gates[2]:.1f}  G3={current_gates[3]:.1f}  G4={current_gates[4]:.1f} m³/min               │
-│                                                                                                          │
-│  扰动:                                                                                                   │
-│    取水: Offtake1={current_offtakes[0]:.1f}  Offtake2={current_offtakes[1]:.1f}  Offtake3={current_offtakes[2]:.1f} m³/min                     │
-│    {fault_status:<100} │
-│                                                                                                          │
-│  MPC参数: 预测时域={prediction_horizon}步({prediction_horizon*dt}min)  控制时域=6步(30min)  采样周期={dt}min                 │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-        """
-
-        ax_info.text(
-            0.5, 0.5,
-            info_text,
-            transform=ax_info.transAxes,
-            fontsize=9,
-            verticalalignment="center",
-            horizontalalignment="center",
-            family="monospace",
-            bbox=dict(boxstyle="round", facecolor="lightblue", alpha=0.3)
-        )
-
-        # 总标题
+        # Main title
         fig.suptitle(
-            f"渠道MPC滚动优化控制动画 - {scenario_desc}",
+            f"MPC Control Animation - {scenario_desc} (Time: {current_time:.0f}/{times[-1]:.0f} min)",
             fontsize=14,
             fontweight="bold"
         )
 
         return []
 
-    # 创建动画（每3帧采样一次，加快速度）
-    frames = range(0, len(times), 3)  # 每隔3个时间步采样
+    # Create animation (sample every frame for smoother playback)
+    frames = range(0, len(times), 1)  # Use all frames
 
     anim = FuncAnimation(
         fig,
         update,
-        init_func=init,
         frames=frames,
-        interval=200,  # 每帧间隔200ms
+        interval=800,  # 800ms per frame (slower for better observation)
         blit=False,
         repeat=True
     )
 
-    # 保存为GIF
+    # Save as GIF
     gif_path = Path(output_dir) / f"mpc_animation_{scenario_desc.replace(' ', '_').replace('，', '_')}.gif"
 
-    print(f"  正在保存动画... (共 {len(frames)} 帧)")
-    writer = PillowWriter(fps=5)  # 5帧/秒
+    print(f"  Saving animation... ({len(frames)} frames)")
+    writer = PillowWriter(fps=2)  # 2 fps (reduced from 5 fps for better observation)
     anim.save(gif_path, writer=writer, dpi=100)
 
     plt.close(fig)
 
-    print(f"✓ MPC动画已保存: {gif_path}")
-    print(f"  文件大小: {gif_path.stat().st_size / 1024:.1f} KB")
+    print(f"✓ MPC animation saved: {gif_path}")
+    print(f"  File size: {gif_path.stat().st_size / 1024:.1f} KB")
 
     return gif_path
 
@@ -1392,12 +1072,12 @@ def generate_report(df, metrics, scenario, output_dir):
 **时间步数**: {len(df)} 步
 """
 
-    # 保存报告
+    # Save report
     report_path = Path(output_dir) / f"REPORT_{scenario_desc.replace(' ', '_')}.md"
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report)
 
-    print(f"✓ 报告已保存: {report_path}")
+    print(f"✓ Report saved: {report_path}")
 
 
 def main():
@@ -1411,7 +1091,7 @@ def main():
     output_dir.mkdir(exist_ok=True)
 
     # 运行多个场景
-    scenarios = ["demand_change", "gate_failure"]  # 只运行有扰动的场景
+    scenarios = ["cascading_demand"]  # 新设计的级联需求场景
     dt = 15  # 控制步长
 
     for scenario_type in scenarios:
